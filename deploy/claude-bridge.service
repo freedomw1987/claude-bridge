@@ -1,0 +1,16 @@
+[Unit]
+Description=claude-bridge Discord bot
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/YOUR_USER/www/claude-bridge
+ExecStart=/home/YOUR_USER/.bun/bin/bun run start
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+Environment=PATH=/home/YOUR_USER/.bun/bin:/usr/local/bin:/usr/bin:/bin
+
+[Install]
+WantedBy=multi-user.target

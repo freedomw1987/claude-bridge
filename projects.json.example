@@ -1,0 +1,18 @@
+{
+  "_comment": "Optional. Place at $PROJECTS_CONFIG path (default: bot cwd).",
+  "_comment2": "All paths support ~ expansion.",
+
+  "projects": {
+    "my-project": "~/code/my-project",
+    "secret-stuff": "/Volumes/External/work"
+  },
+
+  "exclude": [
+    "node_modules-cache",
+    "old-projects"
+  ],
+
+  "hidden": [
+    "playground"
+  ]
+}
