@@ -28,7 +28,7 @@ import {
 import { taskRepoPath } from "../../utils/path";
 import type { SessionStore } from "../../db";
 import type { ProjectRegistry } from "../../projects/registry";
-import { sendHelp, EMPTY_PROMPT_TEXT, NO_TARGET_TEXT } from "../help";
+import { sendHelp, EMPTY_PROMPT_TEXT, NO_TARGET_TEXT, NO_SESSION_TEXT } from "../help";
 import { dispatchCommand } from "./commands";
 import { ensureRepoReady } from "./targets";
 import { forwardToClaude } from "./streaming";
@@ -99,9 +99,7 @@ export async function handleMessageCreate(
         await sendHelp(msg);
         return;
       }
-      await msg.reply(
-        "🤔 No active session in this thread. To start a task, go to your dev channel and type `@bot <prompt>`.",
-      );
+      await msg.reply(NO_SESSION_TEXT);
       return;
     }
 

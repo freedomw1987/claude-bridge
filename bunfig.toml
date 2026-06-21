@@ -1,0 +1,7 @@
+# Bun test config — preload test env so config.ts reads test values
+# before any test file is loaded.
+#
+# See ./test-setup.ts
+
+[test]
+preload = ["./test-setup.ts"]

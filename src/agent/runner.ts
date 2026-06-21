@@ -16,6 +16,11 @@ import type {
   StreamResultError,
 } from "./events";
 
+// Shared TextDecoder instance. Per the WHATWG spec, TextDecoder is stateless
+// and safe to share across concurrent calls (the streaming option is local
+// to each decode() invocation).
+const TEXT_DECODER = new TextDecoder();
+
 export interface ClaudeRunnerOptions {
   prompt: string;
   cwd: string; // working dir for claude (will be the per-thread repo path)
@@ -55,7 +60,7 @@ const PERMISSION_MODE_DEFAULT = "auto";
  * Claude typically uses 300–800MB; 500MB free leaves headroom for the
  * subprocess plus the bot's own footprint (discord.js, queue buffers, etc.).
  */
-const MIN_FREE_BYTES_FOR_CLAUDE = 100 * 1024 * 1024;
+const MIN_FREE_BYTES_FOR_CLAUDE = 10 * 1024 * 1024;
 
 /**
  * Check if there's enough free memory to safely spawn a claude subprocess.
@@ -80,13 +85,12 @@ export function hasEnoughMemoryForClaude(
  */
 async function drainStderr(stream: ReadableStream<Uint8Array>): Promise<void> {
   const reader = stream.getReader();
-  const decoder = new TextDecoder();
   let buf = "";
   try {
     while (true) {
       const { value, done } = await reader.read();
       if (done) break;
-      buf += decoder.decode(value, { stream: true });
+      buf += TEXT_DECODER.decode(value, { stream: true });
       let nl: number;
       while ((nl = buf.indexOf("\n")) >= 0) {
         const line = buf.slice(0, nl);
@@ -112,14 +116,13 @@ async function* parseJsonLines(
   stream: ReadableStream<Uint8Array>,
 ): AsyncGenerator<StreamEvent> {
   const reader = stream.getReader();
-  const decoder = new TextDecoder();
   let buf = "";
 
   try {
     while (true) {
       const { value, done } = await reader.read();
       if (done) break;
-      buf += decoder.decode(value, { stream: true });
+      buf += TEXT_DECODER.decode(value, { stream: true });
       let nl: number;
       while ((nl = buf.indexOf("\n")) >= 0) {
         const line = buf.slice(0, nl).trim();
