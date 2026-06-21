@@ -4,14 +4,27 @@ Discord bot that bridges mentions to Claude Code development sessions.
 
 Each Discord thread = one Claude Code task running on the host.
 
+For long-running development work, the **Hermes Agent** layer adds a
+"project manager" mode where you state a high-level goal and Hermes
+decomposes it into tasks, drives Claude Code through each one, and
+self-assesses completion. See [Hermes Agent](#hermes-agent) below.
+
 ## What it does
 
+### Quick mode (mention `@bot`)
 1. You mention `@bot` in your dev channel
 2. Bot creates a Discord thread for the task
 3. Bot resolves a target: existing project name, `new <name>`, git URL, or local path
 4. Claude Code CLI runs on the host (`claude -p --stream-json`) with that work directory
 5. Streamed output flows back into the thread (in-place message edits, throttled)
 6. Files are written directly to the work dir; session is resumed on follow-ups
+
+### Hermes mode (`/project start`)
+1. You type `@bot /project start "build a CLI todo app"` in your dev channel
+2. Bot creates a Discord thread for the project
+3. **Auto mode (default)**: Hermes (the PM agent) plans 3-10 tasks via an LLM call, invokes Claude Code for each, self-assesses completion.
+   **Manual mode**: the goal is passed directly to Claude Code as a single prompt — equivalent to the original `@bot <prompt>` flow but invoked via `/project start`.
+4. After Claude Code finishes (manual) or all tasks are done (auto), you can continue in the same thread — replies resume the session via the existing `forwardToClaude` flow.
 
 ## Stack
 
@@ -135,6 +148,78 @@ the legacy streaming runner per-thread.
 | `/use-cli` | Switch this thread to the **CLI runner** (legacy `claude -p` subprocess) |
 | `/use-sdk` | Switch this thread to the **SDK runner** (Claude Agent SDK + Discord tools) |
 
+## Hermes Agent
+
+Hermes is an autonomous "project manager" layer that sits on top of
+Claude Code. Two modes:
+
+- **Auto mode (default)**: Hermes plans 3-10 tasks via an LLM, drives
+  Claude Code through each in dependency order, then self-assesses
+  completion with a judge LLM. Best for non-trivial multi-step work.
+- **Manual mode**: the goal is passed directly to Claude Code as a
+  single prompt — equivalent to the original `@bot <prompt>` mention
+  flow, but invoked via `/project start`. Best for short, single-step
+  instructions where you want to keep the Hermes thread / status UI
+  but skip the planning loop.
+
+**Workflow:**
+
+```
+David (Chairman) ─── "build a CLI todo app" ──→ Hermes (PM) ──→ Claude Code (Engineer)
+                              ▲                                    │
+                              └────────── deliverable ─────────────┘
+```
+
+**Quick start:**
+
+```
+/project start "build a CLI todo app"            # auto mode (default)
+/project start --mode=manual "refactor auth"     # manual mode (direct Claude Code)
+/project start in ~/work "build a CLI todo"      # use existing dir
+/project start --max-iterations=5 "quick fix"    # safety cap override
+```
+
+After Claude Code finishes (manual) or all tasks are done (auto), you
+can continue in the same thread — replies resume the session via
+`forwardToClaude`.
+
+**In a project thread:**
+
+| Command | Description |
+|---------|-------------|
+| `/project status` | Show current state, progress, cost, time |
+| `/project plan` | Show the LLM-generated plan (auto mode only) |
+| `/project setMode auto\|manual` | Switch mode (only on non-active projects) |
+| `/project kill` | Mark the project killed; in-flight Claude Code run is aborted |
+| `/project resume` | Re-run a killed or failed project (auto mode) |
+
+**Channel-level (works anywhere):**
+
+| Command | Description |
+|---------|-------------|
+| `/project start [flags] "goal"` | Start a new project (creates a thread) |
+| `/project list` | List all Hermes projects |
+
+**How it works:**
+
+- State is persisted to `data/hermes/projects/<project-id>/state.json`
+  (atomic write) and a human-readable `plan.md` + append-only
+  `journal.log`.
+- The orchestrator runs `planning → executing ⇄ judging → done | failed | killed` (auto mode), or a single `Claude Code invocation → done | failed` (manual mode).
+- The Discord typing indicator is on for the entire run (8s refresh).
+- Safety caps (per project, configurable):
+  - `HERMES_MAX_ITERATIONS` (default 20)
+  - `HERMES_MAX_COST_USD` (default 500 cents = $5.00)
+  - `HERMES_MAX_WALL_HOURS` (default 4)
+  - `HERMES_MAX_ATTEMPTS_PER_TASK` (default 3, auto mode only)
+- Resume: if the bot restarts mid-project, `HERMES_RESUME_ON_STARTUP=1`
+  re-fires the orchestrator for any non-terminal auto project.
+- Rollback: Hermes is purely additive. Remove `src/hermes/` and
+  `src/discord/handlers/hermesCommands.ts` to revert.
+
+See [`docs/operations/0003-hermes-agent.md`](docs/operations/0003-hermes-agent.md)
+for the full design ADR.
+
 ### Resolution order (parser)
 
 When you mention the bot, it tries, in order:
@@ -218,6 +303,8 @@ Weeks 1, 2, 4 complete:
 Phase 1 — Claude Agent SDK path (parallel to CLI, env-var opt-in) ✅
 Phase 1 follow-up — System prompt prefix forcing CC to use `discord_send` ✅
 Phase 2 — Per-thread runner control (`runner_kind` column + `/use-cli`/`/use-sdk`) ✅
+Phase 2.5 — Hardening: CLAUDE_TURN_TIMEOUT + in-process RSS self-watchdog + RAM trace tools ✅
+Phase 3 — Hermes Agent (autonomous PM layer) ✅
 
 ## Layout
 
@@ -228,16 +315,35 @@ claude-bridge/
 │   ├── config.ts                      # env loading
 │   ├── cleanup.ts                     # subprocess tracking + SIGTERM on exit
 │   ├── logger.ts                      # structured logger
+│   ├── memoryMonitor.ts               # in-process RSS self-watchdog + trace writer
 │   ├── types.ts                       # shared types
 │   ├── agent/
-│   │   ├── runner.ts                  # host-side Claude Code runner
-│   │   ├── events.ts                  # stream-json event types
-│   │   └── runner.test.ts             # unit tests
+│   │   ├── runner.ts                  # host-side Claude Code CLI runner
+│   │   ├── sdkRunner.ts               # Claude Agent SDK runner (Phase 2 default)
+│   │   ├── discordTool.ts             # four MCP tools exposed to CC
+│   │   ├── systemPrompt.ts            # Discord-prefixed system prompt loader
+│   │   └── events.ts                  # stream-json event types
+│   ├── hermes/                        # Hermes Agent (Phase 3) — autonomous PM
+│   │   ├── types.ts                   # ProjectState / Task / JournalEntry
+│   │   ├── state.ts                   # atomic state.json I/O + journal append
+│   │   ├── planner.ts                 # LLM goal decomposition (Haiku)
+│   │   ├── judge.ts                   # LLM self-assessment (Haiku)
+│   │   ├── executor.ts                # wraps runViaSdk with task semantics
+│   │   ├── orchestrator.ts            # main state machine + resume
+│   │   ├── typing.ts                  # Discord typing indicator helper
+│   │   └── discord.ts                 # Discord embed/format helpers
 │   ├── discord/
 │   │   ├── client.ts                  # discord.js setup
 │   │   ├── parser.ts                  # mention + URL + project parser
+│   │   ├── sendQueue.ts               # throttled Discord message queue
+│   │   ├── split.ts                   # message chunking
 │   │   └── handlers/
-│   │       └── messageCreate.ts       # main bot logic
+│   │       ├── messageCreate.ts       # main bot logic (dispatch /project + @bot)
+│   │       ├── commands.ts            # /kill /status /projects /repo /use-cli /use-sdk
+│   │       ├── hermesCommands.ts      # /project start|status|list|plan|kill|resume
+│   │       ├── streaming.ts           # CLI / SDK runner dispatch
+│   │       ├── targets.ts             # project list + target resolution + repo clone
+│   │       └── format.ts              # text/tool formatting helpers
 │   ├── projects/
 │   │   └── registry.ts                # ~/www/ project discovery
 │   ├── db/
@@ -246,6 +352,12 @@ claude-bridge/
 │   └── utils/
 │       ├── path.ts                    # tilde expansion
 │       └── git.ts                     # git clone helper
+├── scripts/
+│   ├── memory-watchdog.sh             # OS-level RSS watchdog (cron via launchd)
+│   ├── ram-investigation.sh           # one-shot RAM diagnostic report
+│   ├── ram-trace-summary.sh           # summarize BOT_RAM_TRACE=1 output
+│   ├── notify-discord.sh              # Discord notification helper (used by watchdog)
+│   └── migrate.ts                     # one-time DB additive migrations
 ├── deploy/
 │   ├── com.claudebridge.bot.plist     # macOS launchd
 │   ├── claude-bridge.service          # Linux systemd
@@ -254,9 +366,12 @@ claude-bridge/
 │   ├── PRD.md
 │   ├── ARCHITECTURE.md
 │   ├── MILESTONES.md
-│   └── taskboard.md
-├── scripts/
-│   └── migrate.ts
+│   ├── AUDIT.md
+│   ├── taskboard.md
+│   └── operations/
+│       ├── 0001-bridge-silent-death.md
+│       ├── 0002-bridge-long-task-memory-leak.md
+│       └── 0003-hermes-agent.md
 ├── projects.json.example              # example project aliases/excludes
 ├── data/                              # SQLite + logs (gitignored)
 ├── .env.example
@@ -286,6 +401,17 @@ claude-bridge/
 | `CLAUDE_SDK_MODEL` | (empty) | Optional model override for the SDK path (e.g. `claude-sonnet-4-6`) |
 | `CLAUDE_SDK_PERMISSION_MODE` | `acceptEdits` | Permission mode passed to the SDK |
 | `CLAUDE_SYSTEM_PROMPT_FILE` | `dev_agent/adapters/claude-code/agent.md` | Path to a Markdown file. On the SDK path, a Discord-specific instruction block is prepended automatically. |
+| `CLAUDE_TURN_TIMEOUT_MS` | `3600000` | Hard cap on a single Claude run. The SDK aborts the query via native `AbortController` when exceeded. |
+| `BOT_RSS_THRESHOLD_MB` | `800` | In-process RSS self-watchdog. Bot exits if its RSS exceeds this. Defense-in-depth if the OS-level watchdog is disabled. |
+| `BOT_RSS_SAMPLE_INTERVAL_MS` | `30000` | Self-watchdog sample interval. |
+| `BOT_RAM_TRACE` | `0` | `1` enables appending RSS + heap samples to `data/ram-trace.log` (CSV) for offline long-task validation. |
+| `HERMES_DIR` | `<DATA_DIR>/hermes` | Where Hermes stores project state. |
+| `HERMES_MODEL` | `claude-haiku-4-5` | Model for Hermes's planner + judge LLM calls. Cheap and fast. |
+| `HERMES_MAX_ITERATIONS` | `20` | Per-project hard cap on total task attempts. |
+| `HERMES_MAX_COST_USD` | `500` | Per-project cost cap, in cents ($5.00 default). |
+| `HERMES_MAX_WALL_HOURS` | `4` | Per-project wall-clock cap. |
+| `HERMES_MAX_ATTEMPTS_PER_TASK` | `3` | Retries per individual task before marking failed. |
+| `HERMES_RESUME_ON_STARTUP` | `1` | `1` re-fires the orchestrator for non-terminal projects on bot start. |
 
 ### projects.json (optional)
 
@@ -307,7 +433,7 @@ claude-bridge/
 ## Tests
 
 ```bash
-bun test          # 50 unit tests
+bun test          # 194 unit tests (138 legacy + 56 Phase 2.5/3)
 bun run typecheck # 0 errors
 ```
 

@@ -30,6 +30,7 @@ import type { SessionStore } from "../../db";
 import type { ProjectRegistry } from "../../projects/registry";
 import { sendHelp, EMPTY_PROMPT_TEXT, NO_TARGET_TEXT, NO_SESSION_TEXT } from "../help";
 import { dispatchCommand } from "./commands";
+import { dispatchHermesCommand } from "./hermesCommands";
 import { ensureRepoReady } from "./targets";
 import { forwardToClaude } from "./streaming";
 
@@ -85,6 +86,22 @@ export async function handleMessageCreate(
   });
 
   const botUserId = msg.client.user!.id;
+
+  // Hermes /project commands take precedence over @bot mention handling.
+  // /project start works at top level (no @bot mention needed); other
+  // subcommands work in a project thread. Strip the leading @bot mention
+  // so users can invoke Hermes either way (phone previews often include
+  // the mention automatically). Without this, the legacy parseMention
+  // flow would see "/project" as a path because it starts with "/".
+  const mentionStripped = msg.content.trim().replace(/<@!?\d+>\s*/g, "").trim();
+  if (/^\/project\b/i.test(mentionStripped)) {
+    const handled = await dispatchHermesCommand(mentionStripped, {
+      msg,
+      store,
+      isTopLevel: !msg.channel.isThread(),
+    });
+    if (handled) return;
+  }
 
   // Case A: thread reply — try command dispatch first, then forward
   if (

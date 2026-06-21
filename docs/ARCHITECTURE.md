@@ -2,55 +2,57 @@
 
 ## High-Level Diagram
 
-Two runners are available, selected per-thread via the `runner_kind`
-column in `sessions` and overridable globally via `CLAUDE_USE_SDK`:
+Three layers stacked on a single Discord bot process:
 
 ```
-┌────────────────────────────────────────────────────────────┐
-│ Discord                                                     │
-│  Channel: #dev                                              │
-│  └─ Thread #1 "Fix auth bug on foo/bar"                     │
-│       ├─ Mention message: "@bot ..."                       │
-│       └─ Reply stream: claude output (edited in-place)     │
-└──────────────────────┬─────────────────────────────────────┘
-                       │ Discord WebSocket
-┌──────────────────────▼─────────────────────────────────────┐
-│ Host: claude-bridge bot (Bun + TypeScript + discord.js)    │
-│                                                            │
-│  ┌─────────────────┐  ┌──────────────────┐  ┌───────────┐ │
-│  │ mention parser  │→ │ session manager  │→ │  runner   │ │
-│  │ (extract URL,   │  │ (thread_id ↔     │  │  (CLI or  │ │
-│  │  parse intent)  │  │  claude_session, │  │   SDK)    │ │
-│  └─────────────────┘  │  runner_kind)    │  └─────┬─────┘ │
-│                       └──────────────────┘        │       │
-│  ┌──────────────────────────────────────────────┐  │       │
-│  │ bun:sqlite (sessions.db)                     │  │       │
-│  └──────────────────────────────────────────────┘  │       │
-└────────────────────────────────────────────────────┼───────┘
-                                                     │
-                          ┌──────────────────────────┴─────┐
-                          │ runner_kind = "cli"              │ runner_kind = "sdk"
-                          ▼                                 ▼
-       ┌────────────────────────────────┐    ┌──────────────────────────────────────┐
-       │  Bun.spawn("claude -p --       │    │  query({ prompt, options: {        │
-       │    stream-json")               │    │    resume, cwd, mcpServers,        │
-       │  → parseJsonLines              │    │    systemPrompt, ... } })          │
-       │  → pendingText + SendQueue     │    │  → SDK consumes its own stream     │
-       │  → throttle-edits placeholder  │    │  → CC calls discord_send tool      │
-       │                                │    │    (handler posts to Discord)      │
-       │                                │    │  → CC's plain text is              │
-       │                                │    │    auto-surfaced by the bot        │
-       └────────────────────────────────┘    └──────────────────────────────────────┘
-                          │                                 │
-                          ▼                                 ▼
-       ┌─────────────────────────────────────────────────────────────────────────────────┐
-       │  Claude Code (host subprocess in either case)                                  │
-       │  cwd = <work dir>   (project dir, local path, or TASKS_ROOT/<thread-id>)       │
-       │  Files are written directly to <work dir> on the host.                         │
-       └─────────────────────────────────────────────────────────────────────────────────┘
+                    ┌────────────────────────────────────────┐
+                    │ Discord                                │
+                    │  Channel: #dev                         │
+                    │  ├─ @bot <prompt>     (1-shot)         │
+                    │  └─ /project start    (Hermes PM loop) │
+                    └────────────────────┬───────────────────┘
+                                         │ Discord WebSocket
+                    ┌────────────────────▼───────────────────┐
+                    │ claude-bridge bot                      │
+                    │                                        │
+                    │  ┌────────────┐    ┌─────────────┐     │
+                    │  │ @bot flow  │    │ /project    │     │
+                    │  │ (mention   │    │  (Hermes    │     │
+                    │  │  parser)   │    │  commands)  │     │
+                    │  └─────┬──────┘    └──────┬──────┘     │
+                    │        │                  │            │
+                    │        ▼                  ▼            │
+                    │  ┌──────────┐   ┌──────────────────┐  │
+                    │  │ runner   │   │ Hermes           │  │
+                    │  │  (CLI or │   │  orchestrator    │  │
+                    │  │   SDK)   │   │  + planner/judge │  │
+                    │  └─────┬────┘   │  + executor      │  │
+                    │        │        │  + typing        │  │
+                    │        │        │  + state on disk │  │
+                    │        │        └────────┬─────────┘  │
+                    │        │                 │            │
+                    │        └────────┬────────┘            │
+                    │                 ▼                     │
+                    │       ┌─────────────────┐             │
+                    │       │ runViaSdk()     │             │
+                    │       │ (per task)      │             │
+                    │       └─────────────────┘             │
+                    └─────────────────────┬───────────────┘
+                                          │
+                                          ▼
+                    ┌────────────────────────────────────────┐
+                    │ Claude Code (host subprocess)          │
+                    │  cwd = <work dir>                      │
+                    │  Files written directly to host        │
+                    └────────────────────────────────────────┘
 ```
+
+For the Hermes layer, see [`docs/operations/0003-hermes-agent.md`](operations/0003-hermes-agent.md).
+For the underlying runners (CLI vs SDK), see "IPC: Bot ↔ Claude" below.
 
 ## File / Data Flow
+
+### @bot mention flow (1-shot)
 
 ```
 Discord message
@@ -68,14 +70,10 @@ Discord message
 [bot] if repoUrl: git clone <url> → TASKS_ROOT/<thread-id>/
    │
    ▼
-[bot] Bun.spawn(["claude", "-p", prompt,
-                  "--output-format", "stream-json",
-                  "--verbose", "--permission-mode", mode,
-                  "--resume", claudeSessionId], cwd: repoPath)
+[bot] forward to runner (CLI: spawn claude -p; SDK: query())
    │
-   ▼ (streamed JSON events on stdout)
-[bot] parseJsonLines → typed events
-[bot] throttle-edits a Discord message in the thread
+   ▼
+[bot] streams events back to thread (in-place edits or auto-surfaced text)
 [bot] on completion: UPDATE sessions SET claude_session = <newId>
    │
    ▼
@@ -83,6 +81,50 @@ Discord message
 [claude] exits → process reaped → tracking removed
 
 user can: cd <work dir> && code .
+```
+
+### /project start flow (Hermes — long-running)
+
+```
+Discord: @bot /project start "build a CLI todo app"
+   │
+   ▼
+[messageCreate] strip @bot mention → recognize /project
+   │
+   ▼
+[hermesCommands] handleProjectStart
+   │
+   ▼
+[state.ts] mkdir <HERMES_DIR>/projects/<uuid>/ + write state.json
+[state.ts] INSERT INTO sessions (so /status, /kill still work)
+   │
+   ▼
+[hermesCommands] msg.startThread({ name: "📋 <goal>" })
+   │
+   ▼
+[orchestrator] runProject(uuid) — fire and forget
+   │
+   ▼
+   ┌─ planning ─┐  planner (LLM) → Task[] → state.json
+   │
+   ▼
+   ┌─ executing ┐  for each pending task with deps satisfied:
+   │            │    executor.runViaSdk() → Claude Code
+   │            │    on done/fail → saveState + journal
+   │
+   ▼
+   ┌─ judging ───┐  judge (LLM) → verdict: done | needs_more | stuck
+   │            │
+   │  needs_more: append nextTasks, re-enter executing
+   │  stuck / failed: Discord escalation
+   │  done: completion message
+   │
+   ▼
+[orchestrator] finally: typing.stop()
+
+Meanwhile (on bot restart):
+[index.ts] resumeActiveProjects(hermesDir) re-fires for any
+            non-terminal project found on disk.
 ```
 
 ## Component Responsibilities
@@ -97,7 +139,17 @@ user can: cd <work dir> && code .
 | `src/discord/handlers/messageCreate.ts` | Detect @bot mention in channel, route thread replies, dispatch CLI vs SDK runner |
 | `src/discord/handlers/streaming.ts` | Runner orchestrator (CLI: stream parsing + SendQueue + placeholder; SDK: `query()` + tool dispatch + auto-surface CC plain text) |
 | `src/discord/handlers/commands.ts` | Slash command matchers + handlers (`/kill`, `/status`, `/projects`, `/repo`, `/help`, `/use-cli`, `/use-sdk`) |
+| `src/discord/handlers/hermesCommands.ts` | `/project start|status|list|plan|kill|resume` — see Hermes section below |
 | `src/discord/parser.ts` | Extract target (URL / local path / project name / new project) from mention |
+| `src/memoryMonitor.ts` | In-process RSS self-watchdog. Exits bot if `process.memoryUsage().rss` exceeds `BOT_RSS_THRESHOLD_MB`. Optional trace mode appends every sample to `data/ram-trace.log` (CSV) when `BOT_RAM_TRACE=1`. Defense-in-depth if OS-level `scripts/memory-watchdog.sh` is disabled. |
+| `src/hermes/types.ts` | `ProjectState`, `Task`, `JournalEntry`, `HermesRuntimeConfig` types |
+| `src/hermes/state.ts` | Atomic `state.json` I/O (write-tmp + rename), `journal.log` append, project listing. One project = one dir under `<HERMES_DIR>/projects/<uuid>/`. |
+| `src/hermes/planner.ts` | LLM-based goal decomposition. Uses SDK `query()` with `claude-haiku-4-5` (configurable) and `permissionMode: "plan"` (no tool calls). Returns parsed `Task[]`. |
+| `src/hermes/judge.ts` | LLM-based self-assessment. Verdict shapes: `done` / `needs_more` (with new tasks) / `stuck`. |
+| `src/hermes/executor.ts` | Wraps `runViaSdk` with task semantics: builds the task prompt from goal + previous task outcomes, tracks `attempts` and `lastError`. |
+| `src/hermes/orchestrator.ts` | Main state machine: `planning → executing ⇄ judging → done \| failed \| killed`. Safety caps check (`shouldStop`), per-task retry, judge loop. Includes `resumeActiveProjects()` for bot restart recovery. |
+| `src/hermes/typing.ts` | `TypingIndicator` class — keeps Discord typing on for the whole orchestrator run. 8s refresh (Discord typing expires at 10s). `unref`'d for safety. |
+| `src/hermes/discord.ts` | Embed/format helpers: `formatPlanMessage`, `formatTaskStart`, `formatTaskDone`, `formatCompletion`, `formatEscalation`, `formatStatusEmbed`, `HERMES_PREFIX` (`🪪 Hermes:`). |
 | `src/db/index.ts` | bun:sqlite wrapper, schema migration (additive for `mode`, `runner_kind`, etc.), typed CRUD on sessions |
 | `src/db/schema.sql` | sessions table schema (base columns; additive migrations applied at boot) |
 | `src/agent/runner.ts` | CLI runner: `Bun.spawn` wrapper around `claude -p --stream-json`; parses stream-json events |
@@ -264,6 +316,17 @@ zod version so regressions are easy to spot.
 | `MAX_CONCURRENT_CONTAINERS` | `5` | Cap on simultaneous claude runs |
 | `LOG_LEVEL` | `info` | debug / info / warn / error |
 | `CLAUDE_DEFAULT_PERMISSION_MODE` | `acceptEdits` | Passed to `claude --permission-mode` |
+| `CLAUDE_TURN_TIMEOUT_MS` | `3600000` | Hard cap on a single Claude run (60 min). SDK aborts via `AbortController`. |
+| `BOT_RSS_THRESHOLD_MB` | `800` | In-process RSS self-watchdog. Bot exits if `process.memoryUsage().rss` exceeds this. Defense-in-depth if OS-level `scripts/memory-watchdog.sh` is disabled. |
+| `BOT_RSS_SAMPLE_INTERVAL_MS` | `30000` | Self-watchdog sample interval. |
+| `BOT_RAM_TRACE` | `0` | `1` enables CSV trace logging of RSS + heap to `data/ram-trace.log` for offline long-task validation. |
+| `HERMES_DIR` | `<DATA_DIR>/hermes` | Hermes project state root. |
+| `HERMES_MODEL` | `claude-haiku-4-5` | Model for Hermes's own planner + judge LLM calls. |
+| `HERMES_MAX_ITERATIONS` | `20` | Per-project hard cap on total task attempts. |
+| `HERMES_MAX_COST_USD` | `500` | Per-project cost cap, in cents ($5.00 default). |
+| `HERMES_MAX_WALL_HOURS` | `4` | Per-project wall-clock cap. |
+| `HERMES_MAX_ATTEMPTS_PER_TASK` | `3` | Retries per task before marking failed. |
+| `HERMES_RESUME_ON_STARTUP` | `1` | `1` re-fires orchestrator for non-terminal projects on bot start. |
 
 ## Security Boundary
 
@@ -282,3 +345,51 @@ zod version so regressions are easy to spot.
 
 If you need stronger isolation, see the abandoned Week 3 milestone
 in `MILESTONES.md` for the original Docker plan.
+
+## Hermes Agent (Phase 3)
+
+Hermes is the **autonomous project manager** layer on top of Claude Code.
+See [`docs/operations/0003-hermes-agent.md`](operations/0003-hermes-agent.md)
+for the full design ADR. This section is a quick reference for the
+architecture.
+
+**Three-tier model:**
+
+```
+David (Chairman) — sets direction, /project start, monitors /status
+        ↓
+Hermes (PM) — plans, tracks, judges
+        ↓ invokes runViaSdk() per task
+Claude Code (Engineer) — writes code, runs tests
+        ↓
+Deliverable → David
+```
+
+**Key design decisions:**
+
+- **State on disk** (`<HERMES_DIR>/projects/<uuid>/`): `state.json` (atomic),
+  `plan.md` (human-readable), `journal.log` (append-only). Not in SQLite —
+  the project tree IS the source of truth.
+- **One project = one Discord thread.** The thread ID maps to a single
+  project. `/project start` creates the thread; subsequent `/project status`
+  etc. operate in the existing thread.
+- **Model split**: Hermes's own planner + judge use `claude-haiku-4-5`
+  (cheap, hot-loop). The actual code-writing is done by Claude Code
+  (default `claude-sonnet-4-6`) via the existing `runViaSdk()`.
+- **Safety caps** (per project, configurable):
+  - `HERMES_MAX_ITERATIONS` (default 20)
+  - `HERMES_MAX_COST_USD` (default 500 cents = $5.00)
+  - `HERMES_MAX_WALL_HOURS` (default 4)
+  - `HERMES_MAX_ATTEMPTS_PER_TASK` (default 3)
+- **Discord typing on for the whole run** via `TypingIndicator` (8s
+  refresh). Covers planning LLM, waiting on Claude Code, and judge LLM.
+- **Resume on bot restart** via `HERMES_RESUME_ON_STARTUP=1` (default).
+  Non-terminal projects are re-fired by scanning `<HERMES_DIR>/projects/`.
+- **Mention handling**: `/project` works with or without a leading
+  `@bot` mention. `messageCreate.ts` strips the mention before checking,
+  so `parseMention`'s path-detection doesn't misinterpret `/project` as
+  an absolute path (regression fixed 2026-06-22).
+
+**Rollback:** `rm -rf src/hermes/ src/discord/handlers/hermesCommands.ts` +
+revert `messageCreate.ts` and `index.ts` changes. No SQLite migration,
+no env-var conflicts.

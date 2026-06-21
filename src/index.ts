@@ -8,8 +8,12 @@ import { log } from "./logger";
 import { SessionStore } from "./db";
 import { createClient } from "./discord/client";
 import { join } from "node:path";
+import type { ThreadChannel } from "discord.js";
 import { killAllProcesses } from "./cleanup";
 import { ProjectRegistry } from "./projects/registry";
+import { startMemoryMonitor } from "./memoryMonitor";
+import { resumeActiveProjects } from "./hermes/orchestrator";
+import { resolveHermesDir } from "./hermes/state";
 
 const IDLE_SWEEP_INTERVAL_MS = 60 * 1000; // check every minute
 
@@ -63,6 +67,45 @@ async function main(): Promise<void> {
 
   const client = createClient({ store, projects });
   await client.login(config.discord.token);
+
+  // Internal RSS self-watchdog — defense-in-depth for the long-task
+  // memory leak (ADR-0002). Triggers before the OS-level watchdog
+  // (scripts/memory-watchdog.sh) so the bot can self-protect even when
+  // the OS plist is disabled. Optional trace mode appends every sample
+  // to data/ram-trace.log for offline long-task validation.
+  const tracePath = config.runtime.ramTraceEnabled
+    ? (config.runtime.ramTracePath || join(config.paths.dataDir, "ram-trace.log"))
+    : undefined;
+  const stopMemoryMonitor = startMemoryMonitor({
+    thresholdMB: config.runtime.rssThresholdMB,
+    intervalMs: config.runtime.rssSampleIntervalMs,
+    tracePath,
+  });
+  log.info("memory monitor started", {
+    thresholdMB: config.runtime.rssThresholdMB,
+    intervalMs: config.runtime.rssSampleIntervalMs,
+    traceEnabled: !!tracePath,
+    tracePath,
+  });
+
+  // Hermes: resume any active projects on startup. Reads state.json
+  // files and re-fires the orchestrator for non-terminal projects.
+  // Gated by HERMES_RESUME_ON_STARTUP (default 1).
+  if (config.hermes.resumeOnStartup) {
+    const hermesDir = resolveHermesDir(config.paths.dataDir, config.paths.hermesDir);
+    await resumeActiveProjects(
+      hermesDir,
+      async (threadId) => {
+        try {
+          const ch = await client.channels.fetch(threadId);
+          return ch && ch.isThread() ? (ch as ThreadChannel) : null;
+        } catch {
+          return null;
+        }
+      },
+      (threadId) => store.get(threadId)?.claudeSession ?? null,
+    );
+  }
 
   // Idle sweep: mark active sessions as 'idle' if last_activity_at is older
   // than IDLE_TIMEOUT_MIN. Skipped when IDLE_TIMEOUT_MIN=0 (disabled).
@@ -139,6 +182,7 @@ async function main(): Promise<void> {
     shuttingDown = true;
     log.info("shutting down", { signal });
     if (idleSweep) clearInterval(idleSweep);
+    stopMemoryMonitor();
     await killAllProcesses();
     client.destroy();
     store.close();
