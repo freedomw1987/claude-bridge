@@ -13,6 +13,29 @@ import { ProjectRegistry } from "./projects/registry";
 
 const IDLE_SWEEP_INTERVAL_MS = 60 * 1000; // check every minute
 
+// Global error traps — without these, async errors in the Discord handler
+// chain get silently swallowed (the .catch() inside client.ts logs them,
+// but anything outside that path, e.g. the ws heartbeat tick, can crash
+// the process without a trace).  We log + exit so launchd respawns us
+// with a clean stack.
+//
+// See docs/operations/0001-bridge-silent-death.md for the full incident
+// writeup (2026-06-21 17:59 HKT — gateway dead, no err, no reply).
+process.on("unhandledRejection", (reason) => {
+  log.error("unhandledRejection", {
+    err: String(reason),
+    stack: (reason instanceof Error ? reason.stack : undefined),
+  });
+});
+process.on("uncaughtException", (err) => {
+  log.error("uncaughtException", {
+    err: String(err),
+    stack: err.stack,
+  });
+  // Give the logger a tick to flush, then exit so KeepAlive respawns.
+  setTimeout(() => process.exit(1), 250);
+});
+
 async function main(): Promise<void> {
   log.info("claude-bridge starting", {
     dataDir: config.paths.dataDir,
@@ -67,6 +90,47 @@ async function main(): Promise<void> {
   } else {
     log.info("idle sweep disabled (IDLE_TIMEOUT_MIN=0)");
   }
+
+  // Gateway health probe — every 5 min, check that the Discord ws
+  // connection is still alive.  If it has been disconnected for >10 min
+  // (i.e. the auto-reconnect logic gave up), exit so launchd KeepAlive
+  // respawns the process.  This is the safety net behind the 2026-06-21
+  // "bot silently stopped replying" incident.
+  const GW_HEALTH_INTERVAL_MS = 5 * 60 * 1000;
+  const GW_DISCONNECT_GRACE_MS = 10 * 60 * 1000;
+  let firstDisconnectAt: number | null = null;
+  setInterval(() => {
+    // discord.js exposes ws.status: 0=READY, 1=CONNECTING, 2=RECONNECTING,
+    // 3=IDLE, 4=NEARLY, 5=DISCONNECTED, 6=WAITING_FOR_GUILDS, 7=IDENTIFYING,
+    // 8=RESUMING. Anything other than 0/2 = not healthy.
+    // The `ws` field is internal but stable in v14.
+    const status = (client.ws as { status?: number }).status ?? 0;
+    if (status === 0 || status === 2) {
+      if (firstDisconnectAt !== null) {
+        log.info("gateway recovered", { status, wasDownForMs: Date.now() - firstDisconnectAt });
+      }
+      firstDisconnectAt = null;
+      return;
+    }
+    if (firstDisconnectAt === null) {
+      firstDisconnectAt = Date.now();
+      log.warn("gateway unhealthy", { status });
+      return;
+    }
+    const downFor = Date.now() - firstDisconnectAt;
+    if (downFor > GW_DISCONNECT_GRACE_MS) {
+      log.error("gateway dead beyond grace", {
+        status,
+        downForMs: downFor,
+        graceMs: GW_DISCONNECT_GRACE_MS,
+      });
+      setTimeout(() => process.exit(1), 250);
+    }
+  }, GW_HEALTH_INTERVAL_MS);
+  log.info("gateway health probe started", {
+    intervalMs: GW_HEALTH_INTERVAL_MS,
+    graceMs: GW_DISCONNECT_GRACE_MS,
+  });
 
   // Graceful shutdown
   let shuttingDown = false;

@@ -31,6 +31,22 @@ export function createClient(deps: {
     });
   });
 
+  // Expose a heartbeat probe for the launchd health watchdog. discord.js
+  // emits 'shardDisconnect'/'shardReconnecting' but not all background-
+  // process ws drops surface as a clean event — we also probe status
+  // every 5 min (see src/index.ts) and process.exit(1) if the gateway
+  // has been disconnected for too long, letting KeepAlive respawn us.
+  client.on(Events.ShardDisconnect, (closeEvent, shardId) => {
+    log.warn("gateway shardDisconnect", {
+      shardId,
+      code: closeEvent?.code,
+      reason: closeEvent?.reason,
+    });
+  });
+  client.on(Events.ShardReconnecting, (shardId) => {
+    log.info("gateway shardReconnecting", { shardId });
+  });
+
   client.on(Events.MessageCreate, (msg) => {
     handleMessageCreate(msg, { store, projects }).catch((err) => {
       log.error("messageCreate handler failed", {
