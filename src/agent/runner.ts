@@ -190,7 +190,13 @@ export async function runClaude(
   // when something goes wrong (auth failures, network errors, etc.).
   const stderrDrain = drainStderr(proc.stderr);
 
-  const collectedText: string[] = [];
+  // Note: we no longer buffer the streamed text in the runner. The
+  // streaming.ts caller owns the text-forwarding pipeline (post each
+  // chunk to Discord via SendQueue) and the final result text comes
+  // back to us in the terminal `result` event from the stream-json
+  // protocol. This keeps the runner memory footprint O(toolUses) and
+  // O(1) per text event, instead of O(total streamed text). See
+  // docs/operations/0002-bridge-long-task-memory-leak.md.
   const toolUses: Array<{ name: string; input: unknown }> = [];
   let sessionId = opts.sessionId ?? "";
   let result: StreamResultSuccess | StreamResultError | null = null;
@@ -203,7 +209,8 @@ export async function runClaude(
       const msg = event as StreamAssistantMessage;
       for (const block of msg.message.content) {
         if (block.type === "text") {
-          collectedText.push(block.text);
+          // Forward immediately — do NOT retain. The caller decides
+          // whether to post to Discord, log, or drop.
           callbacks.onTextDelta?.(block.text);
         } else if (block.type === "thinking") {
           callbacks.onThinking?.(block.thinking);
@@ -252,7 +259,7 @@ export async function runClaude(
     // Process exited without a result event — treat as error
     return {
       sessionId,
-      text: collectedText.join(""),
+      text: "",
       toolUses,
       durationMs: 0,
       costUsd: 0,
@@ -267,7 +274,9 @@ export async function runClaude(
     result.subtype === "success"
       ? {
           sessionId: result.session_id,
-          text: collectedText.join("") || result.result,
+          // Terminal result.result is the canonical final text from
+          // Claude; if missing for any reason, fall back to empty.
+          text: result.result ?? "",
           toolUses,
           durationMs: result.duration_ms,
           costUsd: result.total_cost_usd,
@@ -277,7 +286,7 @@ export async function runClaude(
         }
       : {
           sessionId: result.session_id,
-          text: collectedText.join(""),
+          text: "",
           toolUses,
           durationMs: result.duration_ms,
           costUsd: 0,

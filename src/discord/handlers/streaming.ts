@@ -135,32 +135,22 @@ export async function forwardToClaude(
   let finalResultForHighlight: ClaudeRunResult | null = null;
   let finalError: string | null = null;
 
-  const collectedText: string[] = [];
+  // Pending text buffer: each text event from Claude appends here. When
+  // we cross TEXT_FLUSH_THRESHOLD, we post the buffer as a new Discord
+  // message (via the SendQueue) and reset. This keeps our memory
+  // footprint O(threshold) and avoids the 10GB leak that the old
+  // streamText accumulator caused on long Claude runs. See
+  // docs/operations/0002-bridge-long-task-memory-leak.md.
+  const TEXT_FLUSH_THRESHOLD = 1900;
+  let pendingText = "";
+  let postedBytes = 0;
+  let postedChunks = 0;
+
+  // Status: a small mutable string we edit into the placeholder every
+  // 1.5s via setInterval. Limited to ~500 chars max — never grows.
   const toolUses: ToolUseRecord[] = [];
   let sessionId = session.claudeSession ?? "";
-  let lastEditAt = 0;
   let lastActivity = "💭 thinking…";
-  // For multi-message streaming: if text overflows Discord's 2000-char limit,
-  // we post a new "stream" message and continue editing that. The placeholder
-  // stays as the status/summary anchor.
-  let streamMsg: Message | null = null;
-  let streamText = "";
-
-  const postNewStream = async (): Promise<Message | null> => {
-    try {
-      // postNewStream is called inside flushStream after the queue is set up.
-      // We bypass the queue here because the next step is an immediate
-      // .edit() — the queued send would delay the edit unnecessarily.
-      const m: Message = (await thread.send("…")) as Message;
-      return m;
-    } catch {
-      return null;
-    }
-  };
-
-  const renderStreamPreview = (): string => {
-    return truncate(streamText, 1900);
-  };
 
   const renderStatus = (): string => {
     const recent = toolUses.slice(-4).map((t) => {
@@ -174,76 +164,34 @@ export async function forwardToClaude(
         ? `${ic} ${t.name}: ${t.detail}${resultBadge}`
         : `${ic} ${t.name}${resultBadge}`;
     });
-    const status = [lastActivity, ...recent].join("\n");
+    const status = [
+      lastActivity,
+      ...recent,
+      `📤 ${postedChunks} chunk${postedChunks === 1 ? "" : "s"} (${(postedBytes / 1024).toFixed(1)} KB streamed)`,
+    ].join("\n");
     return truncate(status, 1500);
   };
 
-  const editPlaceholder = async () => {
-    const now = Date.now();
-    if (now - lastEditAt < 800) return; // 800ms throttle
-    lastEditAt = now;
-    try {
-      const text = `${renderStatus()}\n\n${streamText ? `**Streaming:**\n${renderStreamPreview()}` : "(no text yet)"}`;
-      await placeholder.edit(truncate(text, 1900));
-    } catch {
-      // ignore rate-limit
-    }
-  };
+  // Throttled placeholder edit. We use a setInterval-based loop instead
+  // of callback-driven edits so the callback chain stays synchronous
+  // (no fire-and-forget promises retaining the status string).
+  const editInterval = setInterval(() => {
+    placeholder.edit(renderStatus()).catch(() => {});
+  }, 1500);
+  // Edit immediately too, so the initial status shows up.
+  placeholder.edit(renderStatus()).catch(() => {});
 
-  const flushStream = async () => {
-    // If stream text exceeds 1900 chars, post a new message for the overflow.
-    // CRITICAL: use splitForDiscord (not truncate) so we preserve ALL content.
-    // Truncation here would silently drop the tail of long responses.
-    if (streamText.length > 1800) {
-      const chunks = splitForDiscord(streamText, DISCORD_MAX);
-      if (streamMsg) {
-        // First chunk: edit the existing stream message
-        try {
-          await streamMsg.edit(chunks[0]);
-        } catch {
-          /* ignore */
-        }
-        // Subsequent chunks: post as new messages (don't lose data)
-        // Routed through the SendQueue so they don't trip Discord's rate limit.
-        for (let i = 1; i < chunks.length; i++) {
-          try {
-            await send(chunks[i]);
-          } catch (err) {
-            log.warn("failed to post stream overflow chunk", {
-              chunk: i,
-              err: String(err),
-            });
-          }
-        }
-      } else {
-        // No existing stream message — post all chunks as new messages
-        for (let i = 0; i < chunks.length; i++) {
-          try {
-            if (i === 0) {
-              streamMsg = await postNewStream();
-              if (streamMsg) await streamMsg.edit(chunks[0]);
-            } else {
-              await send(chunks[i]);
-            }
-          } catch (err) {
-            log.warn("failed to post stream chunk", {
-              chunk: i,
-              err: String(err),
-            });
-          }
-        }
-      }
-      // Reset for next chunk
-      streamText = "";
-      streamMsg = null;
-    } else if (streamMsg) {
-      // Small update — still within limits, edit in place
-      try {
-        await streamMsg.edit(truncate(streamText, 1900));
-      } catch {
-        /* ignore */
-      }
-    }
+  // Helper: flush pendingText if it crosses the threshold. Posts via the
+  // queue. Resets the buffer to empty.
+  const flushIfFull = () => {
+    if (pendingText.length < TEXT_FLUSH_THRESHOLD) return;
+    const chunk = pendingText;
+    pendingText = "";
+    postedBytes += chunk.length;
+    postedChunks += 1;
+    send(chunk).catch((err) =>
+      log.warn("failed to post stream chunk", { err: String(err) }),
+    );
   };
 
   let runError: string | null = null;
@@ -263,17 +211,16 @@ export async function forwardToClaude(
           sessionId = sid;
         },
         onTextDelta: (text) => {
-          collectedText.push(text);
-          streamText += text;
-          flushStream().catch(() => {});
-          editPlaceholder();
+          // Append to pending buffer; flush via queue when full.
+          // No retention: pendingText is reset on every flush.
+          pendingText += text;
+          flushIfFull();
         },
         onToolUse: (name, input) => {
           const detail = formatToolUse(name, input);
           toolUses.push({ name, detail });
           const icon = TOOL_ICON[name] ?? "🔧";
           lastActivity = detail ? `${icon} ${name}: ${detail}` : `${icon} ${name}`;
-          editPlaceholder();
         },
         onToolResult: (text, isError) => {
           // Attach result to the most recent tool_use
@@ -287,17 +234,14 @@ export async function forwardToClaude(
           lastActivity = isError
             ? `❌ tool error: ${preview}${text.length > 200 ? "…" : ""}`
             : `✓ result: ${preview}${text.length > 200 ? "…" : ""}`;
-          editPlaceholder();
         },
         onUserText: (text) => {
           // user text from tool_result (when result is text-only)
-          streamText += text;
-          flushStream().catch(() => {});
-          editPlaceholder();
+          pendingText += text;
+          flushIfFull();
         },
         onThinking: () => {
           lastActivity = "💭 thinking…";
-          editPlaceholder();
         },
         onResult: () => {
           /* handled below */
@@ -305,7 +249,7 @@ export async function forwardToClaude(
       },
     );
   } catch (err) {
-    // Bot-side error: collectedText is still populated with everything
+    // Bot-side error: pendingText is still populated with everything
     // Claude streamed. We capture the error and fall through to the final
     // summary, which will prefix the error to the header and ship the
     // collected text. CRITICAL: do NOT overwrite the placeholder here —
@@ -315,6 +259,20 @@ export async function forwardToClaude(
   }
 
   stopTyping();
+  clearInterval(editInterval);
+
+  // Final flush of any remaining pendingText (the last < 1900 chars)
+  // before we transition to the summary phase.
+  if (pendingText.length > 0) {
+    postedBytes += pendingText.length;
+    postedChunks += 1;
+    try {
+      await send(pendingText);
+    } catch (err) {
+      log.warn("failed to post final stream chunk", { err: String(err) });
+    }
+    pendingText = "";
+  }
 
   if (sessionId) {
     store.setClaudeSession(session.threadId, sessionId);
@@ -330,16 +288,6 @@ export async function forwardToClaude(
   } else {
     reactOnDone = "ok";
     if (result) finalResultForHighlight = result;
-  }
-
-  // Finalize any pending stream message before we post the summary
-  if (streamMsg && streamText) {
-    try {
-      const sm = streamMsg as Message;
-      await sm.edit(truncate(streamText, 1900));
-    } catch {
-      /* ignore */
-    }
   }
 
   // Build header
@@ -375,7 +323,10 @@ export async function forwardToClaude(
 
   // Split long body into Discord-friendly chunks. ALWAYS do this — even on
   // error, the user needs to see what Claude said before the failure.
-  const finalText = stripThinkTags(collectedText.join(""));
+  // The final body comes from the terminal `result.text` (set by the
+  // runner from `result.result` of the stream-json protocol), not from
+  // a local accumulator — see docs/operations/0002-bridge-long-task-memory-leak.md
+  const finalText = stripThinkTags(result?.text ?? "");
   const availableForBody = Math.max(0, DISCORD_MAX - header.length);
   const bodyChunks = splitForDiscord(finalText, availableForBody);
 
