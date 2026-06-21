@@ -29,3 +29,10 @@ out/
 
 # Worktrees (per-thread workspaces)
 ../discord-claude-tasks/
+
+# Backup files (created by editing plists)
+*.bak.*
+
+# Local LaunchAgent plists (user-specific, copy from deploy/ instead)
+# Keep com.claudebridge.bot.plist and com.claude.memory-watchdog.plist
+# in deploy/ as templates; install to ~/Library/LaunchAgents/ manually.

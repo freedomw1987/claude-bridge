@@ -7,6 +7,8 @@
 
     <key>ProgramArguments</key>
     <array>
+        <string>/bin/bash</string>
+        <string>/Users/davidchu/www/claude-bridge/scripts/launchd-wrapper.sh</string>
         <string>/Users/davidchu/.bun/bin/bun</string>
         <string>run</string>
         <string>start</string>
@@ -33,7 +35,7 @@
     <key>KeepAlive</key>
     <dict>
         <key>SuccessfulExit</key>
-        <false/>
+        <true/>
         <key>Crashed</key>
         <true/>
     </dict>
@@ -43,5 +45,13 @@
 
     <key>ProcessType</key>
     <string>Background</string>
+
+    <key>HardResourceLimits</key>
+    <dict>
+        <key>NumberOfProcesses</key>
+        <integer>3</integer>
+        <key>ResidentSetSize</key>
+        <integer>1073741824</integer>
+    </dict>
 </dict>
 </plist>
