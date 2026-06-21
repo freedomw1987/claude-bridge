@@ -200,26 +200,28 @@ export async function runClaude(
   const toolUses: Array<{ name: string; input: unknown }> = [];
   let sessionId = opts.sessionId ?? "";
   let result: StreamResultSuccess | StreamResultError | null = null;
+  let streamError: Error | null = null;
 
-  for await (const event of parseJsonLines(proc.stdout)) {
-    if (event.type === "system" && event.subtype === "init") {
-      sessionId = event.session_id;
-      callbacks.onSessionId?.(sessionId);
-    } else if (event.type === "assistant") {
-      const msg = event as StreamAssistantMessage;
-      for (const block of msg.message.content) {
-        if (block.type === "text") {
-          // Forward immediately — do NOT retain. The caller decides
-          // whether to post to Discord, log, or drop.
-          callbacks.onTextDelta?.(block.text);
-        } else if (block.type === "thinking") {
-          callbacks.onThinking?.(block.thinking);
-        } else if (block.type === "tool_use") {
-          toolUses.push({ name: block.name, input: block.input });
-          callbacks.onToolUse?.(block.name, block.input);
+  try {
+    for await (const event of parseJsonLines(proc.stdout)) {
+      if (event.type === "system" && event.subtype === "init") {
+        sessionId = event.session_id;
+        callbacks.onSessionId?.(sessionId);
+      } else if (event.type === "assistant") {
+        const msg = event as StreamAssistantMessage;
+        for (const block of msg.message.content) {
+          if (block.type === "text") {
+            // Forward immediately — do NOT retain. The caller decides
+            // whether to post to Discord, log, or drop.
+            callbacks.onTextDelta?.(block.text);
+          } else if (block.type === "thinking") {
+            callbacks.onThinking?.(block.thinking);
+          } else if (block.type === "tool_use") {
+            toolUses.push({ name: block.name, input: block.input });
+            callbacks.onToolUse?.(block.name, block.input);
+          }
         }
-      }
-    } else if (event.type === "user") {
+      } else if (event.type === "user") {
       // Tool results come as user events. Capture any text content.
       const um = event.message as { content?: Array<unknown> } | undefined;
       const content = um?.content;
@@ -246,6 +248,18 @@ export async function runClaude(
       result = event;
     }
   }
+  } catch (err) {
+    // Stream parse error (JSON malformed, pipe closed early, ENOENT, etc.)
+    // Capture the error and convert to a structured failure result below
+    // instead of letting the rejection escape runClaude and become an
+    // unhandledRejection that crashes the bot. See 2026-06-22 incident.
+    streamError = err instanceof Error ? err : new Error(String(err));
+    log.error("stream parse failed", {
+      err: streamError.message,
+      sessionId,
+      toolUseCount: toolUses.length,
+    });
+  }
 
   const exitCode = await proc.exited;
   untrackProcess(proc.pid);
@@ -254,6 +268,22 @@ export async function runClaude(
   // which happens shortly after process exit). Any final buffered bytes
   // are already logged by drainStderr.
   await stderrDrain;
+
+  if (streamError) {
+    // Stream parse failed — return a structured failure so the caller
+    // can report it without the rejection escaping runClaude.
+    return {
+      sessionId,
+      text: "",
+      toolUses,
+      durationMs: 0,
+      costUsd: 0,
+      inputTokens: 0,
+      outputTokens: 0,
+      isError: true,
+      errorMessage: `stream parse failed: ${streamError.message}`,
+    };
+  }
 
   if (!result) {
     // Process exited without a result event — treat as error

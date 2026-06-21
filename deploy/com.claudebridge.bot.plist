@@ -2,58 +2,48 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <key>Label</key>
-    <string>com.claudebridge.bot</string>
-
-    <key>ProgramArguments</key>
-    <array>
-        <string>/bin/bash</string>
-        <string>/Users/davidchu/www/claude-bridge/scripts/launchd-wrapper.sh</string>
-        <string>/Users/davidchu/.bun/bin/bun</string>
-        <string>run</string>
-        <string>start</string>
-    </array>
-
-    <key>WorkingDirectory</key>
-    <string>/Users/davidchu/Sites/localhost/claude-bridge</string>
-
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>PATH</key>
-        <string>/Users/davidchu/.bun/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
-    </dict>
-
-    <key>StandardOutPath</key>
-    <string>/Users/davidchu/Sites/localhost/claude-bridge/data/bot.log</string>
-
-    <key>StandardErrorPath</key>
-    <string>/Users/davidchu/Sites/localhost/claude-bridge/data/bot.err.log</string>
-
-    <key>RunAtLoad</key>
-    <true/>
-
-    <key>KeepAlive</key>
-    <dict>
-        <key>SuccessfulExit</key>
-        <true/>
-        <key>Crashed</key>
-        <true/>
-    </dict>
-
-    <key>ThrottleInterval</key>
-    <integer>10</integer>
-
-    <key>ProcessType</key>
-    <string>Background</string>
-
-    <key>HardResourceLimits</key>
-    <dict>
-        <key>NumberOfProcesses</key>
-        <integer>3</integer>
-        <key>NumberOfFiles</key>
-        <integer>512</integer>
-        <key>ResidentSetSize</key>
-        <integer>1073741824</integer>
-    </dict>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>/Users/davidchu/.bun/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/Applications/Docker.app/Contents/Resources/bin</string>
+	</dict>
+	<key>HardResourceLimits</key>
+	<dict>
+		<key>NumberOfFiles</key>
+		<integer>512</integer>
+		<key>NumberOfProcesses</key>
+		<integer>3</integer>
+		<key>ResidentSetSize</key>
+		<integer>1610612736</integer>
+	</dict>
+	<key>KeepAlive</key>
+	<dict>
+		<key>Crashed</key>
+		<true/>
+		<key>SuccessfulExit</key>
+		<true/>
+	</dict>
+	<key>Label</key>
+	<string>com.claudebridge.bot</string>
+	<key>ProcessType</key>
+	<string>Background</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/bin/bash</string>
+		<string>/Users/davidchu/www/claude-bridge/scripts/launchd-wrapper.sh</string>
+		<string>/Users/davidchu/.bun/bin/bun</string>
+		<string>run</string>
+		<string>start</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StandardErrorPath</key>
+	<string>/Users/davidchu/www/claude-bridge/data/bot.err.log</string>
+	<key>StandardOutPath</key>
+	<string>/Users/davidchu/www/claude-bridge/data/bot.log</string>
+	<key>ThrottleInterval</key>
+	<integer>10</integer>
+	<key>WorkingDirectory</key>
+	<string>/Users/davidchu/www/claude-bridge</string>
 </dict>
 </plist>
