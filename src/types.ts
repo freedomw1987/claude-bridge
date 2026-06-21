@@ -10,7 +10,6 @@ export interface Session {
   repoUrl: string | null;
   localPath: string | null;
   repoPath: string;
-  containerId: string | null;
   claudeSession: string | null;
   status: SessionStatus;
   createdAt: number;

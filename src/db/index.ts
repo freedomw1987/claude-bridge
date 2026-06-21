@@ -25,6 +25,15 @@ export class SessionStore {
     }
     const sql = readFileSync(schemaPath, "utf-8");
     this.db.exec(sql);
+
+    // Forward cleanup: drop vestigial columns from abandoned features.
+    // Wrapped in try-catch because the column may not exist on fresh installs
+    // or after a prior cleanup run. SQLite supports DROP COLUMN since 3.35.
+    try {
+      this.db.exec("ALTER TABLE sessions DROP COLUMN container_id;");
+    } catch {
+      // Column doesn't exist — fresh install or already dropped
+    }
   }
 
   create(input: {
@@ -72,6 +81,20 @@ export class SessionStore {
     return rows.map((r) => this.rowToSession(r));
   }
 
+  /**
+   * Find active sessions whose last activity is older than `idleSinceMs`.
+   * Used by the idle sweep to mark timed-out sessions.
+   */
+  findStale(opts: { idleSinceMs: number }): Session[] {
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM sessions
+          WHERE status = 'active' AND last_activity_at < ?`,
+      )
+      .all(opts.idleSinceMs) as Record<string, unknown>[];
+    return rows.map((r) => this.rowToSession(r));
+  }
+
   touch(threadId: string, delta = 1): void {
     this.db
       .prepare(
@@ -88,12 +111,6 @@ export class SessionStore {
     this.db
       .prepare(`UPDATE sessions SET status = ? WHERE thread_id = ?`)
       .run(status, threadId);
-  }
-
-  setContainer(threadId: string, containerId: string | null): void {
-    this.db
-      .prepare(`UPDATE sessions SET container_id = ? WHERE thread_id = ?`)
-      .run(containerId, threadId);
   }
 
   setClaudeSession(threadId: string, claudeSession: string): void {
@@ -134,7 +151,6 @@ export class SessionStore {
       repoUrl: (row.repo_url as string | null) ?? null,
       localPath: (row.local_path as string | null) ?? null,
       repoPath: row.repo_path as string,
-      containerId: (row.container_id as string | null) ?? null,
       claudeSession: (row.claude_session as string | null) ?? null,
       status: row.status as SessionStatus,
       createdAt: row.created_at as number,

@@ -14,7 +14,6 @@
  */
 
 import type { Message, ThreadChannel } from "discord.js";
-import { ChannelType } from "discord.js";
 import { config } from "../../config";
 import { log } from "../../logger";
 import {
@@ -25,7 +24,14 @@ import {
   isValidProjectName,
 } from "../parser";
 import { splitForDiscord, DISCORD_MAX } from "../split";
+import {
+  sendHelp,
+  EMPTY_PROMPT_TEXT,
+  NO_TARGET_TEXT,
+  NO_SESSION_TEXT,
+} from "../help";
 import { taskRepoPath } from "../../utils/path";
+import { activeProcessCount } from "../../cleanup";
 import type { SessionStore } from "../../db";
 import { runClaude, type ClaudeRunResult } from "../../agent/runner";
 import { gitClone } from "../../utils/git";
@@ -53,6 +59,8 @@ const isStatusCommand = (content: string): boolean => /^\/status\b/i.test(conten
 
 const isProjectsCommand = (content: string): boolean =>
   /^\/projects\b/i.test(content.trim());
+
+const isHelpCommand = (content: string): boolean => /^\/help\b/i.test(content.trim());
 
 const truncate = (s: string, max: number): string =>
   s.length <= max ? s : s.slice(0, max - 3) + "...";
@@ -227,8 +235,14 @@ export async function handleMessageCreate(
 ): Promise<void> {
   const { store, projects } = deps;
 
-  if (msg.author.bot) return;
-  if (msg.author.id !== config.discord.allowedUserId) return;
+  if (msg.author.bot) {
+    log.debug("ignored: bot author", { authorId: msg.author.id });
+    return;
+  }
+  if (msg.author.id !== config.discord.allowedUserId) {
+    log.debug("ignored: unauthorized user", { authorId: msg.author.id });
+    return;
+  }
 
   // Channel gate: either a top-level message in the configured channel,
   // or any message in a thread whose parent is the configured channel.
@@ -236,7 +250,20 @@ export async function handleMessageCreate(
   const inThreadOfChannel =
     msg.channel.isThread() &&
     msg.channel.parentId === config.discord.channelId;
-  if (!inConfiguredChannel && !inThreadOfChannel) return;
+  if (!inConfiguredChannel && !inThreadOfChannel) {
+    log.debug("ignored: wrong channel", {
+      channelId: msg.channelId,
+      parentId: msg.channel.isThread() ? msg.channel.parentId : null,
+    });
+    return;
+  }
+
+  log.debug("message received", {
+    channelId: msg.channelId,
+    isThread: msg.channel.isThread(),
+    isMention: msg.mentions.users.size > 0,
+    contentPreview: msg.content.slice(0, 80),
+  });
 
   const botUserId = msg.client.user!.id;
 
@@ -247,13 +274,17 @@ export async function handleMessageCreate(
   ) {
     const session = store.get(msg.channel.id);
     if (!session) {
-      await msg.reply("(no active session in this thread)");
+      await msg.reply(NO_SESSION_TEXT);
+      return;
+    }
+
+    if (isHelpCommand(msg.content)) {
+      await sendHelp(msg);
       return;
     }
 
     if (isKillCommand(msg.content)) {
       store.setStatus(session.threadId, "killed");
-      store.setContainer(session.threadId, null);
       await msg.reply("🛑 Session killed. Files remain on host.");
       return;
     }
@@ -293,7 +324,10 @@ export async function handleMessageCreate(
   }
 
   // Case B: top-level mention
-  if (!isMentioningBot(msg, botUserId)) return;
+  if (!isMentioningBot(msg, botUserId)) {
+    log.debug("ignored: no mention in channel");
+    return;
+  }
 
   const parsed = parseMention(msg.content, botUserId, { projects });
   log.info("received mention", {
@@ -301,7 +335,15 @@ export async function handleMessageCreate(
     repoUrl: parsed.repoUrl,
     localPath: parsed.localPath,
     newProject: parsed.newProject,
+    promptLen: parsed.prompt.length,
   });
+
+  // Empty prompt: just @bot with no content. Don't create a useless thread.
+  if (parsed.prompt.trim() === "" && !parsed.newProject && !parsed.repoUrl && !parsed.localPath) {
+    log.info("empty prompt — sending usage hint");
+    await msg.reply(EMPTY_PROMPT_TEXT);
+    return;
+  }
 
   let resolvedLocalPath: string | null = null;
 
@@ -391,7 +433,7 @@ export async function handleMessageCreate(
     lines.push(`Local: \`${parsed.localPath}\``);
     lines.push(`Work dir: \`${resolvedLocalPath}\``);
   } else {
-    lines.push("⚠️ No target — send `/repo <url|path|name>` in this thread.");
+    lines.push(NO_TARGET_TEXT);
   }
   lines.push("", "⏳ Starting Claude Code...");
   await thread.send(lines.join("\n"));
@@ -472,7 +514,8 @@ async function ensureRepoReady(
   }
   if (!session.repoUrl) return false;
   try {
-    await gitClone(session.repoUrl, session.repoPath);
+    const timeoutMs = config.runtime.gitCloneTimeoutMin * 60 * 1000;
+    await gitClone(session.repoUrl, session.repoPath, timeoutMs);
     log.info("repo ready", { path: session.repoPath });
     return true;
   } catch (err) {
@@ -494,6 +537,21 @@ async function forwardToClaude(
   if (!session.repoUrl && !session.repoPath) {
     await thread.send(
       "⚠️ No target set. Send `/repo <url|path|name>` first, then re-send your message.",
+    );
+    return;
+  }
+
+  // Enforce concurrency cap. Prevents OOM / FD exhaustion when many threads
+  // are active at once. Reply with a clear message and skip the run.
+  const cap = config.runtime.maxConcurrentContainers;
+  if (activeProcessCount() >= cap) {
+    log.info("concurrency cap reached, skipping run", {
+      active: activeProcessCount(),
+      cap,
+      threadId: session.threadId,
+    });
+    await thread.send(
+      `⏳ ${activeProcessCount()} claude run${activeProcessCount() === 1 ? "" : "s"} already in flight (cap: ${cap}). Please wait and try again.`,
     );
     return;
   }
@@ -792,5 +850,3 @@ async function forwardToClaude(
     await safeReact(userMsg, "❌");
   }
 }
-
-void ChannelType;

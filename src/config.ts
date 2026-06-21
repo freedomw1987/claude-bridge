@@ -23,6 +23,7 @@ const optionalInt = (key: string, fallback: number): number => {
   if (!v) return fallback;
   const n = parseInt(v, 10);
   if (Number.isNaN(n)) throw new Error(`Env var ${key} must be integer, got: ${v}`);
+  if (n < 0) throw new Error(`Env var ${key} must be non-negative, got: ${n}`);
   return n;
 };
 
@@ -41,11 +42,8 @@ export const config = {
   runtime: {
     idleTimeoutMin: optionalInt("IDLE_TIMEOUT_MIN", 30),
     maxConcurrentContainers: optionalInt("MAX_CONCURRENT_CONTAINERS", 5),
+    gitCloneTimeoutMin: optionalInt("GIT_CLONE_TIMEOUT_MIN", 5),
     logLevel: optional("LOG_LEVEL", "info"),
-  },
-  docker: {
-    agentImage: optional("AGENT_IMAGE", "claude-bridge-agent:latest"),
-    network: optional("DOCKER_NETWORK", ""),
   },
   claude: {
     defaultPermissionMode: optional("CLAUDE_DEFAULT_PERMISSION_MODE", "acceptEdits"),

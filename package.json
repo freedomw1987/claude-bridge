@@ -9,7 +9,6 @@
     "start": "bun run src/index.ts",
     "test": "bun test",
     "typecheck": "tsc --noEmit",
-    "lint": "bun run scripts/lint.ts",
     "db:migrate": "bun run scripts/migrate.ts"
   },
   "dependencies": {

@@ -6,8 +6,7 @@ CREATE TABLE IF NOT EXISTS sessions (
   channel_id       TEXT NOT NULL,
   repo_url         TEXT,        -- git URL (clone required) — null when local_path is set
   local_path       TEXT,        -- local filesystem path (no clone) — null when repo_url is set
-  repo_path        TEXT NOT NULL,  -- resolved dir the container sees: TASKS_ROOT/<thread-id> or expand(local_path)
-  container_id     TEXT,
+  repo_path        TEXT NOT NULL,  -- resolved dir: TASKS_ROOT/<thread-id> or expand(local_path)
   claude_session   TEXT,
   status           TEXT NOT NULL DEFAULT 'active',
   created_at       INTEGER NOT NULL,
