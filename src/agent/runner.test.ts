@@ -17,7 +17,8 @@ import {
   isAssistantToolUse,
   isResult,
 } from "./events";
-import { hasEnoughMemoryForClaude } from "./runner";
+// hasEnoughMemoryForClaude was removed when the memory check was dropped
+// (per user: personal use, concurrency cap is sufficient).
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { ProjectRegistry } from "../projects/registry";
@@ -467,44 +468,5 @@ describe("formatToolUse", () => {
   });
   it("falls back to first string field for unknown tools", () => {
     expect(formatToolUse("CustomTool", { foo: "bar" })).toBe("foo: `bar`");
-  });
-});
-
-describe("hasEnoughMemoryForClaude", () => {
-  // Pass minBytes explicitly so the tests are independent of whatever
-  // the default value happens to be (changed by the linter across versions).
-  const MB = 1024 * 1024;
-  const TEST_MIN = 50 * MB;
-
-  it("passes when free memory meets the threshold", () => {
-    const r = hasEnoughMemoryForClaude(60 * MB, TEST_MIN);
-    expect(r.ok).toBe(true);
-    expect(r.freeMB).toBe(60);
-    expect(r.requiredMB).toBe(50);
-  });
-
-  it("fails when free memory is below the threshold", () => {
-    const r = hasEnoughMemoryForClaude(40 * MB, TEST_MIN);
-    expect(r.ok).toBe(false);
-    expect(r.freeMB).toBe(40);
-    expect(r.requiredMB).toBe(50);
-  });
-
-  it("passes at exactly the threshold", () => {
-    const r = hasEnoughMemoryForClaude(50 * MB, TEST_MIN);
-    expect(r.ok).toBe(true);
-  });
-
-  it("uses live os.freemem() when freeBytes is omitted", () => {
-    // Don't assert ok — system memory varies. Just check structure.
-    const r = hasEnoughMemoryForClaude(undefined, TEST_MIN);
-    expect(typeof r.freeMB).toBe("number");
-    expect(r.requiredMB).toBe(50);
-  });
-
-  it("rounds MB values to integers (no float drift)", () => {
-    const r = hasEnoughMemoryForClaude(1500 * MB, TEST_MIN);
-    expect(Number.isInteger(r.freeMB)).toBe(true);
-    expect(Number.isInteger(r.requiredMB)).toBe(true);
   });
 });

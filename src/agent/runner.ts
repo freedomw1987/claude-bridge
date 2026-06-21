@@ -8,7 +8,6 @@
 import { log } from "../logger";
 import { trackProcess, untrackProcess } from "../cleanup";
 import { existsSync } from "node:fs";
-import { freemem } from "node:os";
 import type {
   StreamEvent,
   StreamAssistantMessage,
@@ -54,29 +53,6 @@ export interface ClaudeRunnerCallbacks {
 }
 
 const PERMISSION_MODE_DEFAULT = "auto";
-
-/**
- * Minimum free memory (bytes) required to safely spawn a claude subprocess.
- * Claude typically uses 300–800MB; 500MB free leaves headroom for the
- * subprocess plus the bot's own footprint (discord.js, queue buffers, etc.).
- */
-const MIN_FREE_BYTES_FOR_CLAUDE = 10 * 1024 * 1024;
-
-/**
- * Check if there's enough free memory to safely spawn a claude subprocess.
- * Exported for testing. Defaults to live `os.freemem()` but accepts overrides
- * so tests can pass mock values.
- */
-export function hasEnoughMemoryForClaude(
-  freeBytes: number = freemem(),
-  minBytes: number = MIN_FREE_BYTES_FOR_CLAUDE,
-): { ok: boolean; freeMB: number; requiredMB: number } {
-  return {
-    ok: freeBytes >= minBytes,
-    freeMB: Math.round(freeBytes / 1024 / 1024),
-    requiredMB: Math.round(minBytes / 1024 / 1024),
-  };
-}
 
 /**
  * Drain a stderr stream line-by-line, logging each non-empty line.
@@ -194,18 +170,6 @@ export async function runClaude(
   if (!claudePath) {
     throw new Error(
       "claude not found in PATH. Make sure claude CLI is installed and reachable.",
-    );
-  }
-
-  // Memory preflight. A claude subprocess typically uses 300–800MB. If the
-  // host is already under memory pressure (other heavy apps, many concurrent
-  // runs), spawning another could push the system into swap or OOM. The error
-  // propagates up to forwardToClaude's try/catch and is shown to the user
-  // as a normal "Claude failed" summary.
-  const mem = hasEnoughMemoryForClaude();
-  if (!mem.ok) {
-    throw new Error(
-      `insufficient memory to spawn claude: ${mem.freeMB}MB free, need at least ${mem.requiredMB}MB. Close other apps and try again.`,
     );
   }
 

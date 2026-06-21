@@ -104,7 +104,7 @@ export async function forwardToClaude(
     return;
   }
 
-  // Enforce concurrency cap. Prevents OOM / FD exhaustion when many threads
+  // Enforce concurrency cap. Prevents FD exhaustion when many threads
   // are active at once. Reply with a clear message and skip the run.
   const cap = config.runtime.maxConcurrentContainers;
   if (activeProcessCount() >= cap) {
