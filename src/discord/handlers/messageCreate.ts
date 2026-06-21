@@ -188,6 +188,15 @@ export async function handleMessageCreate(
       return;
     }
     resolvedLocalPath = v.resolved!;
+  } else {
+    // No target resolved (no newProject / repoUrl / localPath) but the
+    // prompt was non-empty (otherwise the empty-prompt check above would
+    // have caught it). Don't create a thread for an unresolvable task —
+    // otherwise we forward to Claude with cwd = a non-existent path and
+    // the spawn fails with ENOENT, surfacing as the cryptic
+    // "Claude Code native binary ... exists but failed to launch" error.
+    await msg.reply(NO_TARGET_TEXT);
+    return;
   }
 
   let thread;

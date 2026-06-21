@@ -50,6 +50,17 @@ export const config = {
     systemPromptFile: expandTilde(
       optional("CLAUDE_SYSTEM_PROMPT_FILE", "dev_agent/adapters/claude-code/agent.md"),
     ),
+    // Phase 1: SDK opt-in. When enabled, the bot uses the Claude Agent SDK
+    // (@anthropic-ai/claude-agent-sdk) instead of shelling out to `claude -p`.
+    // Tool calls (discord_send, discord_typing, discord_react, discord_read_history)
+    // are executed by the SDK's MCP transport; the bot stays a thin proxy.
+    useSdk: optional("CLAUDE_USE_SDK", "0") === "1",
+    sdkModel: optional("CLAUDE_SDK_MODEL", ""),
+    // Default to "bypassPermissions" so the headless SDK doesn't try to
+    // render an interactive permission prompt UI for Bash writes
+    // (e.g. `git commit`). Set CLAUDE_SDK_PERMISSION_MODE=acceptEdits in
+    // .env if you want Edit auto-approval but still prompt for Bash.
+    sdkPermissionMode: optional("CLAUDE_SDK_PERMISSION_MODE", "bypassPermissions"),
   },
 } as const;
 

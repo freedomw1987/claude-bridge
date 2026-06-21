@@ -1,15 +1,22 @@
 /**
  * Claude streaming + run orchestration.
  *
- * `forwardToClaude` is the central function for executing a `claude -p`
- * subprocess against a thread, streaming the JSON output back to Discord
- * with throttled message edits, then posting a final summary.
+ * `forwardToClaude` is the central function for executing a Claude Code run
+ * against a thread. It dispatches to one of two runners based on
+ * `config.claude.useSdk`:
+ *
+ *   - `runViaClaudeCli` — the legacy path: `Bun.spawn("claude -p --output-format
+ *     stream-json --verbose ...")` plus a SendQueue-throttled post loop.
+ *     Phase 0. Carries the full stream-parsing + chunking + status-banner UX.
+ *
+ *   - `runViaSdk` — Phase 1: `query()` against the Claude Agent SDK. Claude
+ *     decides when to send via the `discord_send` tool; the bot just relays
+ *     tool calls. No stream parsing, no pendingText buffer, no chunker.
  *
  * Helpers in this file:
  *   - startTypingIndicator — refresh Discord's typing flag every 8s
  *   - safeReact — best-effort reaction
  *   - highlightReply — reply to a message, with channel.send fallback
- *   - forwardToClaude — the main run orchestrator
  */
 
 import type { Message, ThreadChannel } from "discord.js";
@@ -17,6 +24,7 @@ import { config } from "../../config";
 import { log } from "../../logger";
 import { runClaude, type ClaudeRunResult } from "../../agent/runner";
 import { activeProcessCount } from "../../cleanup";
+import { runViaSdk } from "../../agent/sdkRunner";
 import type { SessionStore } from "../../db";
 import { splitForDiscord, DISCORD_MAX } from "../split";
 import { SendQueue } from "../sendQueue";
@@ -79,7 +87,137 @@ export async function highlightReply(
   }
 }
 
-// ---- Run orchestrator ----
+// ---- Run dispatcher ----
+
+export async function forwardToClaude(
+  userMsg: Message,
+  thread: ThreadChannel,
+  prompt: string,
+  session: ReturnType<SessionStore["get"]> & object,
+  store: SessionStore,
+): Promise<void> {
+  // Phase 2 runner selection:
+  //   - config.claude.useSdk = false → force CLI globally (kill switch)
+  //   - config.claude.useSdk = true  → honor per-thread session.runnerKind
+  // The env var is no longer a per-bot opt-in; it's now a global override.
+  const useSdk = config.claude.useSdk && session.runnerKind === "sdk";
+  if (useSdk) {
+    await runViaSdkWrapper(userMsg, thread, prompt, session, store);
+  } else {
+    await runViaClaudeCli(userMsg, thread, prompt, session, store);
+  }
+}
+
+// ---- SDK path (Phase 1) ----
+
+async function runViaSdkWrapper(
+  userMsg: Message,
+  thread: ThreadChannel,
+  prompt: string,
+  session: ReturnType<SessionStore["get"]> & object,
+  _store: SessionStore,
+): Promise<void> {
+  if (!session.repoPath) {
+    await thread.send(
+      "⚠️ No target set. Send `/repo <url|path|name>` first, then re-send your message.",
+    );
+    return;
+  }
+
+  // Concurrency cap: count active SDK runs as well as CLI subprocesses,
+  // since both consume the same host resources. Use the cap loosely —
+  // SDK sessions are persistent in memory but only consume real CPU
+  // during a turn.
+  const cap = config.runtime.maxConcurrentContainers;
+  if (activeProcessCount() >= cap) {
+    log.info("concurrency cap reached, skipping sdk run", {
+      active: activeProcessCount(),
+      cap,
+      threadId: session.threadId,
+    });
+    await thread.send(
+      `⏳ ${activeProcessCount()} claude run${activeProcessCount() === 1 ? "" : "s"} already in flight (cap: ${cap}). Please wait and try again.`,
+    );
+    return;
+  }
+
+  // SendQueue: same rate-limit primitive as the CLI path. CC may emit many
+  // `discord_send` calls in a burst (typing refresh, final summary,
+  // multi-message answer) and we want to stay under Discord's per-channel
+  // 5 msg / 5 s limit. The queue is fresh per Discord run.
+  const queue = new SendQueue();
+  const send = (content: string): Promise<Message> =>
+    queue.send<Message>((c) => thread.send(c), content);
+
+  const placeholder = await send("⏳ Working...");
+  const stopTyping = startTypingIndicator(thread);
+
+  let result;
+  try {
+    result = await runViaSdk(userMsg, thread, prompt, session, send);
+  } catch (err) {
+    log.error("sdk run threw unexpectedly", { err: String(err) });
+    stopTyping();
+    await placeholder.edit(
+      `❌ Claude error: \`${truncate(String(err), 200)}\``,
+    );
+    await safeReact(userMsg, "❌");
+    return;
+  }
+
+  stopTyping();
+
+  // Persist session ID for resume on next message.
+  if (result.sessionId) {
+    _store.setClaudeSession(session.threadId, result.sessionId);
+  }
+
+  if (result.aborted) {
+    // /kill or shutdown interrupted the run. Don't react as error.
+    await placeholder.edit(`🛑 Run aborted.`);
+    return;
+  }
+
+  if (result.isError) {
+    await placeholder.edit(
+      `❌ Claude error: \`${truncate(result.errorMessage ?? "unknown", 200)}\``,
+    );
+    await highlightReply(
+      userMsg,
+      `❌ Claude failed: \`${truncate(result.errorMessage ?? "unknown", 200)}\``,
+    );
+    await safeReact(userMsg, "❌");
+    return;
+  }
+
+  // Build summary header. With the SDK path there is no streamed text in the
+  // bot — Claude sent messages directly via `discord_send` tool calls. The
+  // header is therefore short: stats only.
+  const header =
+    `🧠 Claude (${(result.durationMs / 1000).toFixed(1)}s · ` +
+    `${result.inputTokens}→${result.outputTokens} tok · ` +
+    `$${result.costUsd.toFixed(4)})\n` +
+    `**${result.toolCallCount} tool call${result.toolCallCount === 1 ? "" : "s"}**` +
+    (result.numTurns > 1 ? ` across ${result.numTurns} turn${result.numTurns === 1 ? "" : "s"}` : "");
+
+  // Edit placeholder to header. The "transcript" of Claude's actual reply
+  // lives in the messages it sent via `discord_send` — they appear in the
+  // thread above the placeholder.
+  try {
+    await placeholder.edit(truncate(header, DISCORD_MAX));
+  } catch (err) {
+    log.warn("failed to edit placeholder with summary", { err: String(err) });
+  }
+
+  const summary =
+    `✅ Done in ${(result.durationMs / 1000).toFixed(1)}s · ` +
+    `${result.toolCallCount} tool call${result.toolCallCount === 1 ? "" : "s"} · ` +
+    `$${result.costUsd.toFixed(4)}`;
+  await highlightReply(userMsg, summary);
+  await safeReact(userMsg, "✅");
+}
+
+// ---- CLI path (legacy) ----
 
 interface ToolUseRecord {
   name: string;
@@ -88,7 +226,7 @@ interface ToolUseRecord {
   resultErr?: boolean;
 }
 
-export async function forwardToClaude(
+async function runViaClaudeCli(
   userMsg: Message,
   thread: ThreadChannel,
   prompt: string,

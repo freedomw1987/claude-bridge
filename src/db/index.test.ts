@@ -173,3 +173,100 @@ test("list returns sessions sorted by last_activity_at DESC", () => {
     throw e;
   }
 });
+
+// ---- Phase 2: runner_kind column ----
+
+test("create() defaults runnerKind to 'sdk'", () => {
+  const { store, cleanup } = setup();
+  try {
+    const s = store.create({
+      threadId: "t-sdk-default",
+      channelId: "c",
+      repoUrl: null,
+      localPath: null,
+      repoPath: "/tmp/foo",
+    });
+    expect(s.runnerKind).toBe("sdk");
+  } finally {
+    cleanup();
+  }
+});
+
+test("create() honors explicit runnerKind", () => {
+  const { store, cleanup } = setup();
+  try {
+    const cli = store.create({
+      threadId: "t-cli",
+      channelId: "c",
+      repoUrl: null,
+      localPath: null,
+      repoPath: "/tmp/foo",
+      runnerKind: "cli",
+    });
+    expect(cli.runnerKind).toBe("cli");
+
+    const sdk = store.create({
+      threadId: "t-sdk",
+      channelId: "c",
+      repoUrl: null,
+      localPath: null,
+      repoPath: "/tmp/foo",
+      runnerKind: "sdk",
+    });
+    expect(sdk.runnerKind).toBe("sdk");
+  } finally {
+    cleanup();
+  }
+});
+
+test("setRunnerKind updates the column bidirectionally", () => {
+  const { store, cleanup } = setup();
+  try {
+    store.create({
+      threadId: "t-switch",
+      channelId: "c",
+      repoUrl: null,
+      localPath: null,
+      repoPath: "/tmp/foo",
+    });
+    expect(store.get("t-switch")!.runnerKind).toBe("sdk");
+
+    store.setRunnerKind("t-switch", "cli");
+    expect(store.get("t-switch")!.runnerKind).toBe("cli");
+
+    store.setRunnerKind("t-switch", "sdk");
+    expect(store.get("t-switch")!.runnerKind).toBe("sdk");
+  } finally {
+    cleanup();
+  }
+});
+
+test("legacy rows (no runner_kind column) read as 'cli'", () => {
+  const { store, cleanup } = setup();
+  try {
+    // Simulate a pre-Phase-2 DB: drop the index, then drop runner_kind,
+    // then insert a row that lacks it. rowToSession should fall back to 'cli'
+    // so legacy threads continue on the CLI runner.
+    const rawDb = (store as unknown as {
+      db: {
+        exec: (s: string) => void;
+        prepare: (s: string) => { run: (...args: unknown[]) => void };
+      };
+    }).db;
+    rawDb.exec("DROP INDEX IF EXISTS idx_sessions_runner_kind");
+    rawDb.exec("ALTER TABLE sessions DROP COLUMN runner_kind");
+    rawDb
+      .prepare(
+        `INSERT INTO sessions
+          (thread_id, channel_id, repo_url, local_path, repo_path, status, created_at, last_activity_at)
+         VALUES (?, ?, NULL, NULL, ?, 'active', 0, 0)`,
+      )
+      .run("legacy-1", "c", "/tmp/legacy");
+
+    const row = store.get("legacy-1");
+    expect(row).not.toBeNull();
+    expect(row!.runnerKind).toBe("cli");
+  } finally {
+    cleanup();
+  }
+});

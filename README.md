@@ -116,7 +116,13 @@ add unit tests too
 ```
 
 The thread shares one Claude Code session across messages; context is preserved
-via `claude --resume <sessionId>`.
+via `claude --resume <sessionId>` (CLI path) or the SDK's on-disk session
+resume (SDK path — see [How it works](#how-it-works)).
+
+By default, threads use the **SDK runner** (Phase 2). CC communicates via
+four custom MCP tools exposed by the bot (`discord_send`, `discord_typing`,
+`discord_react`, `discord_read_history`). Use `/use-cli` to fall back to
+the legacy streaming runner per-thread.
 
 ### Slash-style commands (in threads)
 
@@ -124,8 +130,10 @@ via `claude --resume <sessionId>`.
 |---------|-------------|
 | `/repo <url\|path\|name>` | Set or change the target (git URL, local path, or project name) |
 | `/projects` | List all known projects |
-| `/kill` | Stop the session (subprocess killed; files stay on host) |
-| `/status` | Show session info: thread ID, status, target, claude session, message count |
+| `/kill` | Stop the session (CLI: marks DB row; SDK: also aborts the in-flight query) |
+| `/status` | Show session info: thread ID, status, target, runner, claude session, message count |
+| `/use-cli` | Switch this thread to the **CLI runner** (legacy `claude -p` subprocess) |
+| `/use-sdk` | Switch this thread to the **SDK runner** (Claude Agent SDK + Discord tools) |
 
 ### Resolution order (parser)
 
@@ -154,12 +162,44 @@ sudo systemctl enable --now claude-bridge
 
 ## How it works
 
+Two runners are available. New threads default to the **SDK runner**
+(`CLAUDE_USE_SDK=1`); use `/use-cli` per-thread to fall back to the
+streaming CLI runner.
+
+### SDK runner (default, Phase 2+)
+
 ```
 Discord thread message
-  → bot: stores session in SQLite (thread_id ↔ claude_session_id)
+  → bot: stores session in SQLite (thread_id ↔ claude_session_id,
+                                       runner_kind = "sdk")
+  → bot: query({ prompt, options: { resume, cwd, mcpServers,
+                                     systemPrompt, ... } })
+         cwd = resolved work dir
+  → CC consumes its own stream internally
+  → CC calls mcp__discord-bridge__discord_send (and 3 other tools)
+         → bot handler posts via SendQueue → Discord
+  → CC's plain text responses are auto-surfaced to Discord by the bot
+  → result message → bot edits placeholder with stats header
+  → process exits; on-disk session persists for next /resume
+```
+
+The SDK exposes four custom tools to CC:
+
+| Tool | Purpose |
+|------|---------|
+| `discord_send(content, reply_to_message_id?)` | Post a message to the thread |
+| `discord_typing()` | Show the typing indicator |
+| `discord_react(message_id, emoji)` | Add a reaction emoji |
+| `discord_read_history(limit?)` | Fetch earlier messages from the thread |
+
+### CLI runner (legacy, opt-in via `/use-cli`)
+
+```
+Discord thread message
+  → bot: stores session in SQLite (runner_kind = "cli")
   → bot: Bun.spawn(["claude", "-p", prompt, "--output-format", "stream-json",
                      "--verbose", "--resume", sessionId, ...])
-         cwd = resolved work dir (project dir, local path, or TASKS_ROOT/<thread-id>)
+         cwd = resolved work dir
   → claude writes stream-json to its stdout
   → bot: stdout pipe demux → parseJsonLines → typed events
   → bot: throttle-edits a Discord message as text accumulates
@@ -174,6 +214,10 @@ Weeks 1, 2, 4 complete:
 - Week 2 — Claude Code CLI integration ✅
 - Week 3 — Docker containerization ❌ abandoned (chose host-based CLI instead)
 - Week 4 — Streaming, slash commands, graceful shutdown, deploy ✅
+
+Phase 1 — Claude Agent SDK path (parallel to CLI, env-var opt-in) ✅
+Phase 1 follow-up — System prompt prefix forcing CC to use `discord_send` ✅
+Phase 2 — Per-thread runner control (`runner_kind` column + `/use-cli`/`/use-sdk`) ✅
 
 ## Layout
 
@@ -237,7 +281,11 @@ claude-bridge/
 | `IDLE_TIMEOUT_MIN` | `30` | (reserved) |
 | `MAX_CONCURRENT_CONTAINERS` | `5` | Cap on simultaneous claude runs |
 | `LOG_LEVEL` | `info` | `debug` / `info` / `warn` / `error` |
-| `CLAUDE_DEFAULT_PERMISSION_MODE` | `acceptEdits` | Passed to `claude --permission-mode` |
+| `CLAUDE_DEFAULT_PERMISSION_MODE` | `acceptEdits` | Passed to `claude --permission-mode` (CLI path only) |
+| `CLAUDE_USE_SDK` | `0` | Phase 2: `1` enables the SDK path; `0` forces CLI globally. Per-thread `runner_kind` (set by `/use-sdk` / `/use-cli`) is honored when this is `1`. |
+| `CLAUDE_SDK_MODEL` | (empty) | Optional model override for the SDK path (e.g. `claude-sonnet-4-6`) |
+| `CLAUDE_SDK_PERMISSION_MODE` | `acceptEdits` | Permission mode passed to the SDK |
+| `CLAUDE_SYSTEM_PROMPT_FILE` | `dev_agent/adapters/claude-code/agent.md` | Path to a Markdown file. On the SDK path, a Discord-specific instruction block is prepended automatically. |
 
 ### projects.json (optional)
 

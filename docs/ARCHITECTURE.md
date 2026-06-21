@@ -2,6 +2,9 @@
 
 ## High-Level Diagram
 
+Two runners are available, selected per-thread via the `runner_kind`
+column in `sessions` and overridable globally via `CLAUDE_USE_SDK`:
+
 ```
 ┌────────────────────────────────────────────────────────────┐
 │ Discord                                                     │
@@ -15,33 +18,36 @@
 │ Host: claude-bridge bot (Bun + TypeScript + discord.js)    │
 │                                                            │
 │  ┌─────────────────┐  ┌──────────────────┐  ┌───────────┐ │
-│  │ mention parser  │→ │ session manager  │→ │  agent    │ │
-│  │ (extract URL,   │  │ (thread_id ↔     │  │  runner   │ │
-│  │  parse intent)  │  │  claude_session) │  │  (Bun.    │ │
-│  └─────────────────┘  └──────────────────┘  │   spawn)  │ │
-│                                              └─────┬─────┘ │
+│  │ mention parser  │→ │ session manager  │→ │  runner   │ │
+│  │ (extract URL,   │  │ (thread_id ↔     │  │  (CLI or  │ │
+│  │  parse intent)  │  │  claude_session, │  │   SDK)    │ │
+│  └─────────────────┘  │  runner_kind)    │  └─────┬─────┘ │
+│                       └──────────────────┘        │       │
 │  ┌──────────────────────────────────────────────┐  │       │
 │  │ bun:sqlite (sessions.db)                     │  │       │
 │  └──────────────────────────────────────────────┘  │       │
 └────────────────────────────────────────────────────┼───────┘
-                                                     │ stdout pipe
-                                                     │ stream-json
-                       ┌─────────────────────────────┘
-                       │
-┌──────────────────────▼─────────────────────────────────────┐
-│ Host subprocess: claude CLI                                 │
-│                                                            │
-│  cwd = <work dir>   (project dir, local path, or           │
-│                      TASKS_ROOT/<thread-id>)                │
-│                                                            │
-│  Process:                                                  │
-│    claude -p <prompt> --output-format stream-json \        │
-│          --verbose --permission-mode <mode> \              │
-│          --resume <claudeSessionId>                        │
-│                                                            │
-│  Writes stream-json events to stdout (inherited by bot).   │
-│  Files are written directly to <work dir> on the host.     │
-└────────────────────────────────────────────────────────────┘
+                                                     │
+                          ┌──────────────────────────┴─────┐
+                          │ runner_kind = "cli"              │ runner_kind = "sdk"
+                          ▼                                 ▼
+       ┌────────────────────────────────┐    ┌──────────────────────────────────────┐
+       │  Bun.spawn("claude -p --       │    │  query({ prompt, options: {        │
+       │    stream-json")               │    │    resume, cwd, mcpServers,        │
+       │  → parseJsonLines              │    │    systemPrompt, ... } })          │
+       │  → pendingText + SendQueue     │    │  → SDK consumes its own stream     │
+       │  → throttle-edits placeholder  │    │  → CC calls discord_send tool      │
+       │                                │    │    (handler posts to Discord)      │
+       │                                │    │  → CC's plain text is              │
+       │                                │    │    auto-surfaced by the bot        │
+       └────────────────────────────────┘    └──────────────────────────────────────┘
+                          │                                 │
+                          ▼                                 ▼
+       ┌─────────────────────────────────────────────────────────────────────────────────┐
+       │  Claude Code (host subprocess in either case)                                  │
+       │  cwd = <work dir>   (project dir, local path, or TASKS_ROOT/<thread-id>)       │
+       │  Files are written directly to <work dir> on the host.                         │
+       └─────────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ## File / Data Flow
@@ -84,17 +90,22 @@ user can: cd <work dir> && code .
 | Component | Responsibility |
 |-----------|----------------|
 | `src/index.ts` | Entry point: load config, open DB, start Discord client, install signal handlers |
-| `src/config.ts` | Load + validate env vars |
+| `src/config.ts` | Load + validate env vars (Discord, paths, SDK options, kill switch `CLAUDE_USE_SDK`) |
 | `src/logger.ts` | Structured logging (dev = pretty, prod = JSON) |
-| `src/cleanup.ts` | Track active `claude` subprocess PIDs; SIGTERM them on bot shutdown |
+| `src/cleanup.ts` | Track active `claude` subprocess PIDs; SIGTERM them on bot shutdown (CLI path only) |
 | `src/discord/client.ts` | discord.js client setup, intent config |
-| `src/discord/handlers/messageCreate.ts` | Detect @bot mention in channel, route thread replies |
+| `src/discord/handlers/messageCreate.ts` | Detect @bot mention in channel, route thread replies, dispatch CLI vs SDK runner |
+| `src/discord/handlers/streaming.ts` | Runner orchestrator (CLI: stream parsing + SendQueue + placeholder; SDK: `query()` + tool dispatch + auto-surface CC plain text) |
+| `src/discord/handlers/commands.ts` | Slash command matchers + handlers (`/kill`, `/status`, `/projects`, `/repo`, `/help`, `/use-cli`, `/use-sdk`) |
 | `src/discord/parser.ts` | Extract target (URL / local path / project name / new project) from mention |
-| `src/db/index.ts` | bun:sqlite wrapper, schema migration, typed CRUD on sessions |
-| `src/db/schema.sql` | sessions table schema |
-| `src/agent/runner.ts` | `Bun.spawn` wrapper around `claude -p --stream-json`; parses stream-json events |
-| `src/agent/events.ts` | TypeScript types for `claude --output-format stream-json` events |
-| `src/agent/runner.test.ts` | Unit tests for parser, registry, event type guards |
+| `src/db/index.ts` | bun:sqlite wrapper, schema migration (additive for `mode`, `runner_kind`, etc.), typed CRUD on sessions |
+| `src/db/schema.sql` | sessions table schema (base columns; additive migrations applied at boot) |
+| `src/agent/runner.ts` | CLI runner: `Bun.spawn` wrapper around `claude -p --stream-json`; parses stream-json events |
+| `src/agent/sdkRunner.ts` | SDK runner: wraps `query()` from `@anthropic-ai/claude-agent-sdk`; manages per-thread active queries; auto-surfaces CC's plain text replies |
+| `src/agent/discordTool.ts` | The four custom tools (`discord_send`, `discord_typing`, `discord_react`, `discord_read_history`) exposed to CC via `createSdkMcpServer()` |
+| `src/agent/systemPrompt.ts` | Loads the user's system prompt file and prepends a Discord-specific instruction block on the SDK path |
+| `src/agent/events.ts` | TypeScript types for `claude --output-format stream-json` events (CLI path) |
+| `src/agent/*.test.ts` | Unit tests for runners, tool handlers, system prompt, DB migration |
 | `src/projects/registry.ts` | Auto-scan `PROJECTS_ROOT`; load optional `projects.json` aliases |
 | `src/utils/path.ts` | `~` → `$HOME` expansion |
 | `src/utils/git.ts` | `git clone` host-side helper (only used for git URL targets) |
@@ -113,14 +124,30 @@ CREATE TABLE sessions (
   status           TEXT NOT NULL DEFAULT 'active',  -- active | idle | killed | done
   created_at       INTEGER NOT NULL,           -- unix ms
   last_activity_at INTEGER NOT NULL,
-  total_messages   INTEGER NOT NULL DEFAULT 0
+  total_messages   INTEGER NOT NULL DEFAULT 0,
+  -- Phase 0 (autopilot feature, added in commit f70f6ea):
+  mode             TEXT NOT NULL DEFAULT 'manual',  -- manual | autopilot
+  milestone_goal   TEXT,
+  milestone_criteria TEXT,
+  -- Phase 2: per-thread runner selection
+  runner_kind      TEXT NOT NULL DEFAULT 'sdk'     -- 'cli' | 'sdk'
 );
 
 CREATE INDEX idx_sessions_status ON sessions(status);
 CREATE INDEX idx_sessions_last_activity ON sessions(last_activity_at);
+CREATE INDEX idx_sessions_runner_kind ON sessions(runner_kind);
 ```
 
+`runner_kind` is added by an additive migration at boot (mirroring
+the `mode` pattern). Legacy rows created before the migration read as
+`'cli'` via `rowToSession`'s `?? 'cli'` fallback, preserving prior
+behavior until the user explicitly switches them with `/use-sdk`.
+
 ## IPC: Bot ↔ Claude
+
+Two paths depending on the runner:
+
+### CLI runner (`runner_kind = "cli"`)
 
 The bot reads Claude's stdout directly (no intermediary):
 
@@ -129,7 +156,7 @@ The bot reads Claude's stdout directly (no intermediary):
          stream-json
 ```
 
-`runner.ts` (host-side):
+`src/agent/runner.ts` (host-side):
 ```typescript
 const proc = Bun.spawn({
   cmd: ["claude", "-p", prompt, "--output-format", "stream-json",
@@ -147,6 +174,70 @@ for await (const event of parseJsonLines(proc.stdout)) {
 
 The subprocess is tracked in `cleanup.ts` so SIGTERM on the bot propagates
 to in-flight `claude` runs (no orphan processes).
+
+### SDK runner (`runner_kind = "sdk"`)
+
+The bot uses `@anthropic-ai/claude-agent-sdk`'s `query()` function, which
+spawns a `claude` subprocess internally. The SDK manages the stream and
+dispatches MCP tool calls to our registered handlers.
+
+```
+[bot]  ─── query({ prompt, options }) ───→  [SDK subprocess (managed)]
+                                                       │
+       for-await SDKMessage ◄─── stream-json events ───┘
+              │
+              ├─ assistant (text block)     → strip <thinking>, auto-post to Discord
+              ├─ assistant (tool_use block) → SDK calls our handler (e.g. discord_send)
+              │                                  handler.posts via SendQueue → Discord
+              ├─ system/init (session_id)    → persist for resume
+              └─ result (success/error)      → edit placeholder with stats header
+```
+
+`src/agent/sdkRunner.ts` (host-side):
+```typescript
+const mcpServer = createSdkMcpServer({
+  name: "discord-bridge",
+  tools: allDiscordTools, // [discordSendTool, discordTypingTool, ...]
+});
+
+const q = query({
+  prompt,
+  options: {
+    cwd: session.repoPath,
+    resume: session.claudeSession,
+    mcpServers: { "discord-bridge": mcpServer },
+    systemPrompt: await readSystemPrompt(), // prepended with Discord block
+    permissionMode: config.claude.sdkPermissionMode,
+    canUseTool: async (name) =>
+      name.startsWith("mcp__discord-bridge__")
+        ? { behavior: "allow" }
+        : { behavior: "allow" },
+  },
+});
+
+for await (const msg of q) {
+  // track sessionId, tool count, auto-surface CC text
+}
+```
+
+Sessions persist on disk under `~/.claude/projects/<encoded-cwd>/` and
+are resumed by passing `options.resume = <sessionId>` on subsequent
+runs. Active queries are tracked in an in-memory `Map<threadId, Query>`
+so `/kill` can call `query.close()` to abort mid-flight.
+
+#### Why a Zod 3 pin is required
+
+The `@modelcontextprotocol/sdk` that the agent SDK embeds uses
+`zod-to-json-schema@^3` to convert tool schemas to JSON Schema for the
+MCP protocol. That library is Zod 3 only — it reads `_def.typeName`,
+which doesn't exist on Zod 4 schemas (they have `_def.type` and a
+`_zod` field). Mixing Zod 4 with the MCP layer produces "Zod validation
+error" at the permission layer and every tool call fails.
+
+`package.json` therefore pins `"zod": "^3.25"` and adds an
+`overrides` entry so the entire dependency tree resolves to a single
+Zod 3. The startup diagnostic in `sdkRunner.ts` logs the resolved
+zod version so regressions are easy to spot.
 
 ## Host Paths
 

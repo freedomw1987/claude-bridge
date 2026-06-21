@@ -23,12 +23,17 @@ export const HELP_TEXT = `🤖 **claude-bridge — usage**
 **Inside a thread**
 Just type messages — each one is forwarded to Claude Code.
 Context is preserved across messages (the session is resumed).
+By default, threads use the **SDK runner** (Claude Agent SDK + Discord
+tools: \`discord_send\`, \`discord_typing\`, \`discord_react\`, \`discord_read_history\`).
+Use \`/use-cli\` to switch back to the legacy streaming UX.
 
 **Slash commands** (inside a thread)
 • \`/repo <url|path|name>\` — change the working target
 • \`/projects\` — list all known projects
-• \`/status\` — show current session info
+• \`/status\` — show current session info (incl. runner kind)
 • \`/kill\` — stop the running session (files remain on host)
+• \`/use-cli\` — switch this thread to the CLI runner (legacy streaming)
+• \`/use-sdk\` — switch this thread to the SDK runner (tool-calling)
 • \`/help\` — show this message`;
 
 /**

@@ -6,7 +6,7 @@
 import { Database } from "bun:sqlite";
 import { mkdirSync, readFileSync, existsSync } from "node:fs";
 import { dirname } from "node:path";
-import type { Session, SessionMode, SessionStatus } from "../types";
+import type { RunnerKind, Session, SessionMode, SessionStatus } from "../types";
 
 export class SessionStore {
   private db: Database;
@@ -43,6 +43,13 @@ export class SessionStore {
         name: "milestone_criteria",
         ddl: "ALTER TABLE sessions ADD COLUMN milestone_criteria TEXT",
       },
+      {
+        // Phase 2: per-thread runner selection. New rows default to 'sdk';
+        // legacy rows (predating the migration) keep their CLI behavior via
+        // the `?? 'cli'` fallback in rowToSession.
+        name: "runner_kind",
+        ddl: "ALTER TABLE sessions ADD COLUMN runner_kind TEXT NOT NULL DEFAULT 'sdk'",
+      },
     ];
     for (const col of additiveColumns) {
       try {
@@ -73,7 +80,9 @@ export class SessionStore {
       "ALTER TABLE sessions ADD COLUMN mode TEXT NOT NULL DEFAULT 'manual';",
       "ALTER TABLE sessions ADD COLUMN milestone_goal TEXT;",
       "ALTER TABLE sessions ADD COLUMN milestone_criteria TEXT;",
+      "ALTER TABLE sessions ADD COLUMN runner_kind TEXT NOT NULL DEFAULT 'sdk';",
       "CREATE INDEX IF NOT EXISTS idx_sessions_mode ON sessions(mode);",
+      "CREATE INDEX IF NOT EXISTS idx_sessions_runner_kind ON sessions(runner_kind);",
     ];
     for (const stmt of additiveMigrations) {
       try {
@@ -95,13 +104,19 @@ export class SessionStore {
     repoUrl: string | null;
     localPath: string | null;
     repoPath: string;
+    /**
+     * Phase 2: which runner to use. Defaults to 'sdk' so new threads
+     * opt in to the SDK path. Pass 'cli' to create a session that uses
+     * the legacy `claude -p` subprocess.
+     */
+    runnerKind?: RunnerKind;
   }): Session {
     const now = Date.now();
     this.db
       .prepare(
         `INSERT INTO sessions
-          (thread_id, channel_id, repo_url, local_path, repo_path, status, created_at, last_activity_at)
-         VALUES (?, ?, ?, ?, ?, 'active', ?, ?)`,
+          (thread_id, channel_id, repo_url, local_path, repo_path, status, created_at, last_activity_at, runner_kind)
+         VALUES (?, ?, ?, ?, ?, 'active', ?, ?, ?)`,
       )
       .run(
         input.threadId,
@@ -111,6 +126,7 @@ export class SessionStore {
         input.repoPath,
         now,
         now,
+        input.runnerKind ?? "sdk",
       );
     return this.get(input.threadId)!;
   }
@@ -218,6 +234,17 @@ export class SessionStore {
       .run(claudeSession, threadId);
   }
 
+  /**
+   * Phase 2: switch a session between CLI and SDK runner.
+   * Toggled via /use-cli and /use-sdk commands. Takes effect on the next
+   * message in this thread.
+   */
+  setRunnerKind(threadId: string, kind: RunnerKind): void {
+    this.db
+      .prepare(`UPDATE sessions SET runner_kind = ? WHERE thread_id = ?`)
+      .run(kind, threadId);
+  }
+
   setRepoUrl(threadId: string, repoUrl: string): void {
     this.db
       .prepare(`UPDATE sessions SET repo_url = ?, local_path = NULL WHERE thread_id = ?`)
@@ -260,6 +287,9 @@ export class SessionStore {
       mode: (row.mode as SessionMode | undefined) ?? "manual",
       milestoneGoal: (row.milestone_goal as string | null) ?? null,
       milestoneCriteria: (row.milestone_criteria as string | null) ?? null,
+      // Phase 2: per-thread runner. Default 'cli' for legacy rows
+      // (predating the runner_kind column) — they were CLI before, keep them CLI.
+      runnerKind: (row.runner_kind as RunnerKind | undefined) ?? "cli",
     };
   }
 
