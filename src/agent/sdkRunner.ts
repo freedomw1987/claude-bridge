@@ -169,6 +169,12 @@ export async function runViaSdk(
     // Required by the SDK when permissionMode === "bypassPermissions".
     allowDangerouslySkipPermissions:
       config.claude.sdkPermissionMode === "bypassPermissions",
+    // Wire the SDK's native AbortController so CLAUDE_TURN_TIMEOUT_MS
+    // (default 60 min) can hard-kill a stuck run. See ADR-0002 future
+    // work #2. The controller is passed inline; the setTimeout that
+    // triggers it is created after the query() call below so we have
+    // a handle on the ActiveRun to flip `aborted = true` atomically.
+    abortController: new AbortController(),
     canUseTool: async (
       toolName: string,
       _input: Record<string, unknown>,
@@ -230,6 +236,28 @@ export async function runViaSdk(
   const run: ActiveRun = { query: q, aborted: false };
   activeRuns.set(session.threadId, run);
 
+  // Turn timeout — if the SDK's AbortController fires (via the timer
+  // below), the SDK will TerminateProcess the underlying subprocess and
+  // the for-await loop will see an abort error. We mark `run.aborted`
+  // first so the catch block can distinguish "user/system timeout"
+  // from a real Claude error.
+  const turnTimeoutMs = config.claude.turnTimeoutMs;
+  const turnTimer = setTimeout(() => {
+    run.aborted = true;
+    log.warn("turn timeout exceeded, aborting", {
+      threadId: session.threadId,
+      turnTimeoutMs,
+    });
+    try {
+      q.close();
+    } catch (err) {
+      log.warn("failed to close query on timeout", {
+        threadId: session.threadId,
+        err: String(err),
+      });
+    }
+  }, turnTimeoutMs);
+
   const result: SdkRunResult = {
     sessionId: session.claudeSession ?? "",
     durationMs: 0,
@@ -284,17 +312,28 @@ export async function runViaSdk(
       handleMessage(msg, result);
     }
   } catch (err) {
-    result.isError = true;
-    result.errorMessage = String(err);
-    log.error("sdk run errored", { threadId: session.threadId, err: String(err) });
+    if (run.aborted) {
+      // Aborted by timeout, /kill, or process shutdown — not a Claude error.
+      // The `errorMessage` is set below in the post-loop block; do not
+      // overwrite it with the raw abort error.
+    } else {
+      result.isError = true;
+      result.errorMessage = String(err);
+      log.error("sdk run errored", { threadId: session.threadId, err: String(err) });
+    }
   } finally {
+    clearTimeout(turnTimer);
     activeRuns.delete(session.threadId);
   }
 
   if (run.aborted) {
     result.aborted = true;
-    // An aborted run is not an error per se — the user requested it.
+    // An aborted run is not an error per se — the user requested it
+    // (via /kill) or the system aborted it (turn timeout, shutdown).
     result.isError = false;
+    if (!result.errorMessage) {
+      result.errorMessage = "run aborted (timeout, /kill, or shutdown)";
+    }
   }
 
   void userMsg; // currently unused; reserved for future per-message context

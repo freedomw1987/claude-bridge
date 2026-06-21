@@ -9,7 +9,9 @@
     "start": "bun run src/index.ts",
     "test": "bun test",
     "typecheck": "tsc --noEmit",
-    "db:migrate": "bun run scripts/migrate.ts"
+    "db:migrate": "bun run scripts/migrate.ts",
+    "ram:investigate": "bash scripts/ram-investigation.sh",
+    "ram:summary": "bash scripts/ram-trace-summary.sh"
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.3.185",
