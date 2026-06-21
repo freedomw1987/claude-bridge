@@ -116,11 +116,24 @@ In Discord, send `/status` in any thread created by the bot. It shows:
 
 ## Upgrading
 
+A cross-platform `deploy/restart.sh` handles pull + install + restart on both
+macOS (launchd) and Linux (systemd). It restarts the service if running, or
+starts it if not.
+
 ```bash
-cd ~/Sites/localhost/claude-bridge    # or wherever you checked out
-git pull                   # if versioned
+# Pull latest, install deps, then restart
+./deploy/restart.sh --update
+
+# Just restart (no pull)
+./deploy/restart.sh
+```
+
+Manual equivalent (macOS):
+
+```bash
+cd ~/Sites/localhost/claude-bridge
+git pull
 bun install
-# Restart the service
 launchctl unload ~/Library/LaunchAgents/com.claudebridge.bot.plist
 launchctl load ~/Library/LaunchAgents/com.claudebridge.bot.plist
 ```

@@ -24,6 +24,7 @@ import {
   isLocalPathString,
   isValidProjectName,
 } from "../parser";
+import { splitForDiscord, DISCORD_MAX } from "../split";
 import { taskRepoPath } from "../../utils/path";
 import type { SessionStore } from "../../db";
 import { runClaude, type ClaudeRunResult } from "../../agent/runner";
@@ -136,40 +137,6 @@ function stripThinkTags(text: string): string {
     .replace(/<\/think>/g, "")
     .replace(/\n{3,}/g, "\n\n")
     .trim();
-}
-
-const DISCORD_MAX = 1900; // Discord's real limit is 2000; keep headroom
-
-/**
- * Split a long string into Discord-friendly chunks, each ≤ maxLen characters.
- * Prefers splitting on paragraph boundaries (`\n\n`) to keep formatting readable;
- * falls back to line and word boundaries if needed.
- */
-function splitForDiscord(text: string, maxLen = DISCORD_MAX): string[] {
-  if (text.length <= maxLen) return [text];
-  const chunks: string[] = [];
-  let remaining = text;
-
-  while (remaining.length > maxLen) {
-    // Find a paragraph break within maxLen
-    let cut = remaining.lastIndexOf("\n\n", maxLen);
-    if (cut < maxLen * 0.5) {
-      // No good paragraph break — try a line break
-      cut = remaining.lastIndexOf("\n", maxLen);
-    }
-    if (cut < maxLen * 0.5) {
-      // No good line break — try a space
-      cut = remaining.lastIndexOf(" ", maxLen);
-    }
-    if (cut < maxLen * 0.3) {
-      // Just hard-cut (rare — only for very long unbroken strings)
-      cut = maxLen;
-    }
-    chunks.push(remaining.slice(0, cut).trimEnd());
-    remaining = remaining.slice(cut).trimStart();
-  }
-  if (remaining.length > 0) chunks.push(remaining);
-  return chunks;
 }
 
 /**
@@ -592,30 +559,63 @@ async function forwardToClaude(
   };
 
   const flushStream = async () => {
-    // If stream text exceeds 1900 chars, post a new message for the overflow
+    // If stream text exceeds 1900 chars, post a new message for the overflow.
+    // CRITICAL: use splitForDiscord (not truncate) so we preserve ALL content.
+    // Truncation here would silently drop the tail of long responses.
     if (streamText.length > 1800) {
+      const chunks = splitForDiscord(streamText, DISCORD_MAX);
       if (streamMsg) {
+        // First chunk: edit the existing stream message
         try {
-          await streamMsg.edit(truncate(streamText, 1900));
+          await streamMsg.edit(chunks[0]);
         } catch { /* ignore */ }
+        // Subsequent chunks: post as new messages (don't lose data)
+        for (let i = 1; i < chunks.length; i++) {
+          try {
+            await thread.send(chunks[i]);
+            await new Promise((r) => setTimeout(r, 150));
+          } catch (err) {
+            log.warn("failed to post stream overflow chunk", {
+              chunk: i,
+              err: String(err),
+            });
+          }
+        }
       } else {
-        streamMsg = await postNewStream();
-        if (streamMsg) {
-          try { await streamMsg.edit(truncate(streamText, 1900)); } catch { /* ignore */ }
+        // No existing stream message — post all chunks as new messages
+        for (let i = 0; i < chunks.length; i++) {
+          try {
+            if (i === 0) {
+              streamMsg = await postNewStream();
+              if (streamMsg) await streamMsg.edit(chunks[0]);
+            } else {
+              await thread.send(chunks[i]);
+              await new Promise((r) => setTimeout(r, 150));
+            }
+          } catch (err) {
+            log.warn("failed to post stream chunk", {
+              chunk: i,
+              err: String(err),
+            });
+          }
         }
       }
       // Reset for next chunk
       streamText = "";
       streamMsg = null;
     } else if (streamMsg) {
+      // Small update — still within limits, edit in place
       try {
         await streamMsg.edit(truncate(streamText, 1900));
       } catch { /* ignore */ }
     }
   };
 
+  let runError: string | null = null;
+  let result: ClaudeRunResult | null = null;
+
   try {
-    const result = await runClaude(
+    result = await runClaude(
       {
         prompt,
         cwd: session.repoPath,
@@ -669,85 +669,99 @@ async function forwardToClaude(
         },
       },
     );
-
-    stopTyping();
-
-    if (sessionId) {
-      store.setClaudeSession(session.threadId, sessionId);
-    }
-
-    if (result.isError) {
-      await placeholder.edit(
-        `❌ Claude error: \`${truncate(result.errorMessage ?? "unknown", 200)}\``,
-      );
-      finalError = result.errorMessage ?? "unknown error";
-      reactOnDone = "err";
-      return;
-    }
-    finalResultForHighlight = result;
-
-    // Finalize any pending stream message
-    if (streamMsg && streamText) {
-      try {
-        const sm = streamMsg as Message;
-        await sm.edit(truncate(streamText, 1900));
-      } catch { /* ignore */ }
-    }
-
-    // Build final summary
-    const toolLines = toolUses.map((t) => {
-      const icon = TOOL_ICON[t.name] ?? "🔧";
-      const resultBadge = t.resultErr
-        ? " ❌"
-        : t.result != null
-          ? " ✓"
-          : "";
-      return `  ${icon} ${t.name}${t.detail ? `: ${t.detail}` : ""}${resultBadge}`;
-    });
-    const headerParts = [
-      `🧠 Claude (${(result.durationMs / 1000).toFixed(1)}s · ` +
-        `${result.inputTokens}→${result.outputTokens} tok · ` +
-        `$${result.costUsd.toFixed(4)})`,
-      toolLines.length > 0
-        ? `\n**Activity (${toolUses.length} tool call${toolUses.length === 1 ? "" : "s"}):**\n${toolLines.join("\n")}`
-        : null,
-    ].filter(Boolean) as string[];
-    const header = headerParts.join("\n") + "\n\n";
-
-    // Split long body into Discord-friendly chunks
-    const finalText = stripThinkTags(collectedText.join(""));
-    const bodyChunks = splitForDiscord(finalText, DISCORD_MAX - header.length);
-
-    // First chunk: replace placeholder (or edit if no overflow)
-    if (bodyChunks.length === 0 || (bodyChunks.length === 1 && bodyChunks[0].length === 0)) {
-      // No text — show summary only
-      await placeholder.edit(truncate(header, 1900));
-    } else {
-      await placeholder.edit(truncate(header + bodyChunks[0], 1900));
-    }
-
-    // Subsequent chunks: post as separate messages
-    for (let i = 1; i < bodyChunks.length; i++) {
-      try {
-        const m = await thread.send(bodyChunks[i]);
-        // Small delay to avoid burst rate-limit
-        await new Promise((r) => setTimeout(r, 150));
-        // Reference for potential future use
-        void m;
-      } catch (err) {
-        log.warn("failed to post continuation message", {
-          chunk: i,
-          err: String(err),
-        });
-      }
-    }
-    reactOnDone = "ok";
   } catch (err) {
-    log.error("claude run failed", { err: String(err) });
-    stopTyping();
-    await placeholder.edit(`❌ claude run failed: \`${truncate(String(err), 200)}\``);
-    finalError = String(err);
+    // Bot-side error: collectedText is still populated with everything
+    // Claude streamed. We capture the error and fall through to the final
+    // summary, which will prefix the error to the header and ship the
+    // collected text. CRITICAL: do NOT overwrite the placeholder here —
+    // that would discard the user's view of what Claude said so far.
+    runError = String(err);
+    log.error("claude run failed", { err: runError });
+  }
+
+  stopTyping();
+
+  if (sessionId) {
+    store.setClaudeSession(session.threadId, sessionId);
+  }
+
+  // Determine error state
+  if (runError) {
+    finalError = runError;
     reactOnDone = "err";
+  } else if (result?.isError) {
+    finalError = result.errorMessage ?? "unknown error";
+    reactOnDone = "err";
+  } else {
+    reactOnDone = "ok";
+    if (result) finalResultForHighlight = result;
+  }
+
+  // Finalize any pending stream message before we post the summary
+  if (streamMsg && streamText) {
+    try {
+      const sm = streamMsg as Message;
+      await sm.edit(truncate(streamText, 1900));
+    } catch { /* ignore */ }
+  }
+
+  // Build header
+  const errorPrefix = runError
+    ? `❌ claude run failed: \`${truncate(runError, 200)}\`\n\n`
+    : result?.isError
+      ? `❌ Claude error: \`${truncate(result.errorMessage ?? "unknown", 200)}\`\n\n`
+      : "";
+
+  const toolLines = toolUses.map((t) => {
+    const icon = TOOL_ICON[t.name] ?? "🔧";
+    const resultBadge = t.resultErr
+      ? " ❌"
+      : t.result != null
+        ? " ✓"
+        : "";
+    return `  ${icon} ${t.name}${t.detail ? `: ${t.detail}` : ""}${resultBadge}`;
+  });
+  const statsPart = result && !result.isError
+    ? `🧠 Claude (${(result.durationMs / 1000).toFixed(1)}s · ` +
+      `${result.inputTokens}→${result.outputTokens} tok · ` +
+      `$${result.costUsd.toFixed(4)})`
+    : null;
+  const headerParts = [
+    statsPart,
+    toolLines.length > 0
+      ? `**Activity (${toolUses.length} tool call${toolUses.length === 1 ? "" : "s"}):**\n${toolLines.join("\n")}`
+      : null,
+  ].filter(Boolean) as string[];
+  const header = errorPrefix + (headerParts.length > 0 ? headerParts.join("\n") + "\n\n" : "");
+
+  // Split long body into Discord-friendly chunks. ALWAYS do this — even on
+  // error, the user needs to see what Claude said before the failure.
+  const finalText = stripThinkTags(collectedText.join(""));
+  const availableForBody = Math.max(0, DISCORD_MAX - header.length);
+  const bodyChunks = splitForDiscord(finalText, availableForBody);
+
+  // First chunk: replace placeholder (or edit if no overflow)
+  if (bodyChunks.length === 0 || (bodyChunks.length === 1 && bodyChunks[0].length === 0)) {
+    // No text — show header only
+    await placeholder.edit(truncate(header, DISCORD_MAX));
+  } else {
+    await placeholder.edit(truncate(header + bodyChunks[0], DISCORD_MAX));
+  }
+
+  // Subsequent chunks: post as separate messages
+  for (let i = 1; i < bodyChunks.length; i++) {
+    try {
+      const m = await thread.send(bodyChunks[i]);
+      // Small delay to avoid burst rate-limit
+      await new Promise((r) => setTimeout(r, 150));
+      // Reference for potential future use
+      void m;
+    } catch (err) {
+      log.warn("failed to post continuation message", {
+        chunk: i,
+        err: String(err),
+      });
+    }
   }
 
   // Highlight: reply to the user's original message. Discord shows a yellow
