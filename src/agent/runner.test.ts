@@ -17,6 +17,7 @@ import {
   isAssistantToolUse,
   isResult,
 } from "./events";
+import { hasEnoughMemoryForClaude } from "./runner";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { ProjectRegistry } from "../projects/registry";
@@ -466,5 +467,39 @@ describe("formatToolUse", () => {
   });
   it("falls back to first string field for unknown tools", () => {
     expect(formatToolUse("CustomTool", { foo: "bar" })).toBe("foo: `bar`");
+  });
+});
+
+describe("hasEnoughMemoryForClaude", () => {
+  it("passes when free memory meets the default threshold (500MB)", () => {
+    const r = hasEnoughMemoryForClaude(600 * 1024 * 1024);
+    expect(r.ok).toBe(true);
+    expect(r.freeMB).toBe(600);
+    expect(r.requiredMB).toBe(500);
+  });
+
+  it("fails when free memory is below the threshold", () => {
+    const r = hasEnoughMemoryForClaude(400 * 1024 * 1024);
+    expect(r.ok).toBe(false);
+    expect(r.freeMB).toBe(400);
+    expect(r.requiredMB).toBe(500);
+  });
+
+  it("passes at exactly the threshold", () => {
+    const r = hasEnoughMemoryForClaude(500 * 1024 * 1024);
+    expect(r.ok).toBe(true);
+  });
+
+  it("supports a custom threshold for testing", () => {
+    const r = hasEnoughMemoryForClaude(100 * 1024 * 1024, 50 * 1024 * 1024);
+    expect(r.ok).toBe(true);
+    expect(r.requiredMB).toBe(50);
+  });
+
+  it("rounds MB values to integers (no float drift)", () => {
+    // 1.4 GB free, 500 MB required — both should be whole numbers
+    const r = hasEnoughMemoryForClaude(1500 * 1024 * 1024);
+    expect(Number.isInteger(r.freeMB)).toBe(true);
+    expect(Number.isInteger(r.requiredMB)).toBe(true);
   });
 });
