@@ -19,6 +19,7 @@ import { runClaude, type ClaudeRunResult } from "../../agent/runner";
 import { activeProcessCount } from "../../cleanup";
 import type { SessionStore } from "../../db";
 import { splitForDiscord, DISCORD_MAX } from "../split";
+import { SendQueue } from "../sendQueue";
 import { truncate, stripThinkTags, containsQuestion, formatToolUse, TOOL_ICON } from "./format";
 
 // ---- Discord helpers ----
@@ -118,7 +119,15 @@ export async function forwardToClaude(
     return;
   }
 
-  const placeholder = await thread.send("⏳ Running Claude Code...");
+  // Rate-limit all subsequent thread.send calls through this queue.
+  // Discord's per-channel limit is ~5 msg / 5s; bursty flushStream +
+  // final-summary posts can blow past that. The queue spaces sends out
+  // (~1.1s apart) while keeping the first send immediate.
+  const queue = new SendQueue();
+  const send = (content: string): Promise<Message> =>
+    queue.send<Message>((c) => thread.send(c), content);
+
+  const placeholder = await send("⏳ Running Claude Code...");
 
   // Show typing indicator + react to user's message on completion
   const stopTyping = startTypingIndicator(thread);
@@ -139,7 +148,10 @@ export async function forwardToClaude(
 
   const postNewStream = async (): Promise<Message | null> => {
     try {
-      const m: Message = await thread.send("…");
+      // postNewStream is called inside flushStream after the queue is set up.
+      // We bypass the queue here because the next step is an immediate
+      // .edit() — the queued send would delay the edit unnecessarily.
+      const m: Message = (await thread.send("…")) as Message;
       return m;
     } catch {
       return null;
@@ -192,10 +204,10 @@ export async function forwardToClaude(
           /* ignore */
         }
         // Subsequent chunks: post as new messages (don't lose data)
+        // Routed through the SendQueue so they don't trip Discord's rate limit.
         for (let i = 1; i < chunks.length; i++) {
           try {
-            await thread.send(chunks[i]);
-            await new Promise((r) => setTimeout(r, 150));
+            await send(chunks[i]);
           } catch (err) {
             log.warn("failed to post stream overflow chunk", {
               chunk: i,
@@ -211,8 +223,7 @@ export async function forwardToClaude(
               streamMsg = await postNewStream();
               if (streamMsg) await streamMsg.edit(chunks[0]);
             } else {
-              await thread.send(chunks[i]);
-              await new Promise((r) => setTimeout(r, 150));
+              await send(chunks[i]);
             }
           } catch (err) {
             log.warn("failed to post stream chunk", {
@@ -379,12 +390,11 @@ export async function forwardToClaude(
     await placeholder.edit(truncate(header + bodyChunks[0], DISCORD_MAX));
   }
 
-  // Subsequent chunks: post as separate messages
+  // Subsequent chunks: post as separate messages, routed through the queue
+  // to stay under Discord's per-channel rate limit.
   for (let i = 1; i < bodyChunks.length; i++) {
     try {
-      const m = await thread.send(bodyChunks[i]);
-      // Small delay to avoid burst rate-limit
-      await new Promise((r) => setTimeout(r, 150));
+      const m = await send(bodyChunks[i]);
       // Reference for potential future use
       void m;
     } catch (err) {

@@ -50,6 +50,38 @@ export interface ClaudeRunnerCallbacks {
 const PERMISSION_MODE_DEFAULT = "auto";
 
 /**
+ * Drain a stderr stream line-by-line, logging each non-empty line.
+ * Returns a Promise that resolves when the stream ends. Run in parallel
+ * with stdout parsing so the child process never blocks on stderr writes.
+ */
+async function drainStderr(stream: ReadableStream<Uint8Array>): Promise<void> {
+  const reader = stream.getReader();
+  const decoder = new TextDecoder();
+  let buf = "";
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      let nl: number;
+      while ((nl = buf.indexOf("\n")) >= 0) {
+        const line = buf.slice(0, nl);
+        buf = buf.slice(nl + 1);
+        if (line.trim()) {
+          log.warn("claude stderr", { line: line.slice(0, 500) });
+        }
+      }
+    }
+    // Flush any trailing line without a newline
+    if (buf.trim()) {
+      log.warn("claude stderr", { line: buf.slice(0, 500) });
+    }
+  } finally {
+    reader.releaseLock();
+  }
+}
+
+/**
  * Parse a stream of JSON lines into events. Tolerates partial lines in the buffer.
  */
 async function* parseJsonLines(
@@ -148,6 +180,13 @@ export async function runClaude(
 
   trackProcess(proc.pid);
 
+  // Drain stderr in parallel with stdout parsing. The OS pipe buffer is
+  // typically 64KB — if claude writes verbose stderr while we're mid-parse
+  // of stdout, the child blocks on its next stderr write and the bot appears
+  // to hang. Logging each line as it arrives also gives real-time signal
+  // when something goes wrong (auth failures, network errors, etc.).
+  const stderrDrain = drainStderr(proc.stderr);
+
   const collectedText: string[] = [];
   const toolUses: Array<{ name: string; input: unknown }> = [];
   let sessionId = opts.sessionId ?? "";
@@ -201,11 +240,10 @@ export async function runClaude(
   const exitCode = await proc.exited;
   untrackProcess(proc.pid);
 
-  // Drain stderr for diagnostics
-  const stderrText = await new Response(proc.stderr).text();
-  if (stderrText.trim()) {
-    log.warn("claude stderr", { stderr: stderrText.slice(0, 500) });
-  }
+  // Wait for the stderr drain to finish (it ends when the stream ends,
+  // which happens shortly after process exit). Any final buffered bytes
+  // are already logged by drainStderr.
+  await stderrDrain;
 
   if (!result) {
     // Process exited without a result event — treat as error
