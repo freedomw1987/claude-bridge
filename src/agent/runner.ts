@@ -7,6 +7,7 @@
 
 import { log } from "../logger";
 import { trackProcess, untrackProcess } from "../cleanup";
+import { existsSync } from "node:fs";
 import type {
   StreamEvent,
   StreamAssistantMessage,
@@ -123,6 +124,12 @@ export async function runClaude(
     argsLen: args.length,
     hasResume: !!opts.sessionId,
   });
+
+  // Defensive: isValidLocalPath may have passed, but the dir could have been
+  // deleted between check and use. Fail fast with a clear error.
+  if (!existsSync(opts.cwd)) {
+    throw new Error(`work directory does not exist: ${opts.cwd}`);
+  }
 
   const claudePath = Bun.which("claude");
   if (!claudePath) {

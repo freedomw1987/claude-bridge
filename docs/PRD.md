@@ -67,7 +67,7 @@ Discord Channel
 ### F6 — Cleanup (Week 4)
 - Manual `/kill` command: kill the subprocess, keep files + session row
 - Graceful shutdown: SIGTERM all in-flight subprocesses on `SIGINT` / `SIGTERM`
-- (Future) Idle-timeout sweep is reserved but not yet implemented
+- (Future) Idle-timeout sweep is reserved but not yet implemented — *implemented in v1.0.1*
 
 ## Non-functional Requirements
 
@@ -90,5 +90,5 @@ Discord Channel
 
 ## Open Questions
 
-- Max concurrent `claude` runs? (Decision: 5, configurable — *enforcement deferred*)
-- Idle timeout? (Decision: 30 min, configurable — *reserved, not yet enforced*)
+- Max concurrent `claude` runs? (Decision: 5, configurable — *enforced in v1.0.1*)
+- Idle timeout? (Decision: 30 min, configurable — *enforced in v1.0.1; set to 0 to disable*)

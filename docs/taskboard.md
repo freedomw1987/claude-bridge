@@ -90,5 +90,11 @@ None. Project is feature-complete for v1 (host-based mode).
 - Multi-user support not built (single-user by design)
 - Slack/Telegram adapters would share most of the core
 - Auto-cleanup of old `~/www/discord-claude-tasks/*` not implemented
-- `tsconfig.json` declares a `@/*` path alias but no runtime alias is configured
-  (harmless — no `@/...` imports exist in the codebase)
+
+## Resolved in v1.0.1 (PR1 — production hardening)
+
+- ✅ `MAX_CONCURRENT_CONTAINERS` now enforced (reply and skip if at cap)
+- ✅ `IDLE_TIMEOUT_MIN` now enforced via periodic sweep (set to 0 to disable)
+- ✅ `gitClone` now has a timeout (`GIT_CLONE_TIMEOUT_MIN`, default 5)
+- ✅ Negative integer env vars rejected at startup
+- ✅ `runClaude` validates cwd exists before spawning (handles race with deletion)
