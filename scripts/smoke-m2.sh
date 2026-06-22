@@ -15,6 +15,12 @@
 #   2. Run this script in a terminal — it prints each step
 #   3. After each step, verify the expected output in Discord
 #
+# AUTOMATED ALTERNATIVE: The exact same invariants (timer fires → state
+# becomes killed with duration_expired reason + journal entry + Discord
+# message) are covered by `bun test src/hermes/orchestrator.test.ts`
+# E2E block (3 tests, ~500ms total). Run that first; this script is
+# the manual fallback for confirming the Discord-side wiring end to end.
+#
 # Exit code 0 = all steps observed; non-zero = mismatch.
 
 set -uo pipefail

@@ -3,7 +3,10 @@
  * Does NOT exercise the full orchestrator loop (which requires Discord + SDK).
  */
 
-import { describe, test, expect } from "bun:test";
+import { describe, test, expect, beforeEach, afterEach } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   armProjectTimer,
   checkTimerExpired,
@@ -11,6 +14,12 @@ import {
   shouldStop,
   softExit,
 } from "./orchestrator";
+import {
+  appendJournal,
+  ensureProjectDir,
+  loadState,
+  saveState,
+} from "./state";
 import {
   DEFAULT_HERMES_CONFIG,
   isActive,
@@ -520,4 +529,221 @@ describe("armProjectTimer", () => {
     expect(s.timer!.handle).toBe(handle as ReturnType<typeof setTimeout>);
     if (handle != null) clearTimeout(handle as ReturnType<typeof setTimeout>);
   });
+});
+
+// ── E2E: timer fires → softExit (M2.11 / ADR-0004) ───────────────────
+//
+// This is the M2.11 manual-smoke-test, but as an automated integration
+// test that runs in <500ms. The invariants it pins are:
+//
+//   1. armProjectTimer + a wallclock delay → callback fires at the deadline
+//   2. The callback path used in resumeActiveProjects re-loads state from
+//      disk before softExit, so it works correctly across "old state"
+//      (the closure was bound to a snapshot)
+//   3. softExit with reason="duration_expired" writes:
+//        - state.json with status=killed, killedReason=duration_expired,
+//          timer cleared
+//        - journal entry
+//        - one Discord send (formatTimerExpired text)
+//   4. isActive(killed) === false → a second softExit call would no-op
+//      (idempotency, but we don't need to retest that here)
+//
+// We do NOT exercise runProject's full pipeline (planner/executor/judge
+// LLM calls). The test is scoped to the timer-softExit integration that
+// is the entire M2.4–M2.6 / M2.11 surface. It would survive a refactor
+// that moves softExit into a different module, as long as the disk-level
+// observable behavior matches.
+
+let tmpRoot: string;
+let hermesDir: string;
+
+beforeEach(() => {
+  tmpRoot = mkdtempSync(join(tmpdir(), "hermes-m2-e2e-"));
+  hermesDir = join(tmpRoot, "hermes");
+});
+
+afterEach(() => {
+  rmSync(tmpRoot, { recursive: true, force: true });
+});
+
+function e2eBaseState(projectId: string, overrides: Partial<ProjectState> = {}): ProjectState {
+  const s = newProjectState({
+    id: projectId,
+    threadId: "t-e2e",
+    goal: "g-e2e",
+    mode: "auto",
+    repoPath: "/r-e2e",
+    repoSource: "new",
+    config: DEFAULT_HERMES_CONFIG,
+  });
+  s.startedAt = new Date(Date.now() - 1_000).toISOString();
+  return { ...s, ...overrides };
+}
+
+/**
+ * state.ts writes under `projectDir(hermesDir, projectId) = hermesDir/projects/<id>`.
+ * Tests that read the on-disk files must use the same path resolution.
+ */
+function projectPath(hermesDir: string, projectId: string, file: string): string {
+  return join(hermesDir, "projects", projectId, file);
+}
+
+describe("E2E M2.11 — timer fires → softExit (duration_expired)", () => {
+  test(
+    "end-to-end: arm timer → wait → on-disk state becomes killed (duration_expired)",
+    async () => {
+      // 1. Set up: persist a judging project with a 200ms timer.
+      const projectId = "p-e2e-1";
+      const state = e2eBaseState(projectId, { status: "judging" });
+      state.timer = {
+        expiresAt: Date.now() + 200,
+        handle: undefined,
+        requestedDuration: "200ms",
+        effectiveMs: 200,
+        clamped: false,
+      };
+      ensureProjectDir(hermesDir, projectId);
+      saveState(hermesDir, projectId, state);
+      appendJournal(hermesDir, projectId, {
+        type: "status",
+        message: "project started (auto, 200ms timer)",
+      });
+
+      // 2. Arm the timer, then schedule the runProject judge boundary
+      //    the same way resumeActiveProjects does it. This is the wiring
+      //    we are testing end-to-end.
+      const thread = new FakeThread();
+
+      // Simulate the on-disk snapshot that resumeActiveProjects would
+      // have read (just-loaded, before the judge boundary).
+      const loaded = loadState(hermesDir, projectId)!;
+      const projectIdCopy = projectId;
+      const threadCopy = thread;
+      const armHandle = armProjectTimer(loaded, () => {
+        // This is the EXACT shape of the closure in resumeActiveProjects:
+        // re-load fresh state, bail if !isActive, otherwise softExit.
+        const fresh = loadState(hermesDir, projectIdCopy);
+        if (!fresh) return;
+        if (!isActive(fresh)) return;
+        softExit(projectIdCopy, fresh, {
+          hermesDir,
+          thread: threadCopy as unknown as import("discord.js").ThreadChannel,
+          claudeSession: null,
+        }, "duration_expired").catch((err) => {
+          throw err;
+        });
+      });
+      expect(armHandle).not.toBeNull();
+      // Sanity: the original loaded snapshot is still active (no mutation
+      // from armProjectTimer beyond the handle field).
+      expect(isActive(loaded)).toBe(true);
+
+      // 3. Wait 400ms — the timer (200ms) fires, the callback runs,
+      //    softExit mutates and saves, posts a Discord message.
+      await new Promise((r) => setTimeout(r, 400));
+
+      // 4. Verify the on-disk state.
+      const after = loadState(hermesDir, projectId)!;
+      expect(after).toBeDefined();
+      expect(after.status).toBe("killed");
+      expect(after.killedReason).toBe("duration_expired");
+      expect(after.endedAt).toBeDefined();
+      expect(after.timer).toBeUndefined();
+      expect(isActive(after)).toBe(false);
+
+      // 5. Verify the journal got the timer entry.
+      const journalPath = projectPath(hermesDir, projectId, "journal.log");
+      const fs = await import("node:fs");
+      const journal = fs.readFileSync(journalPath, "utf8");
+      expect(journal).toContain("duration expired");
+      expect(journal).toContain("auto-mode duration expired");
+      expect(journal).toContain("200ms");
+
+      // 6. Verify Discord got exactly one message.
+      expect(thread.sent.length).toBe(1);
+      expect(thread.sent[0]).toContain("Auto-mode duration elapsed");
+      expect(thread.sent[0]).toContain("⏱");
+
+      // 7. Cleanup the arm handle (defensive; the callback already ran).
+      if (armHandle != null) {
+        clearTimeout(armHandle as ReturnType<typeof setTimeout>);
+      }
+    },
+  );
+
+  test(
+    "manual_switch path: softExit posts the manual message and writes the manual journal entry",
+    async () => {
+      const projectId = "p-e2e-manual";
+      const state = e2eBaseState(projectId, { status: "executing" });
+      state.timer = {
+        expiresAt: Date.now() + 60_000,
+        handle: undefined,
+        requestedDuration: "30m",
+        effectiveMs: 1_800_000,
+        clamped: false,
+      };
+      ensureProjectDir(hermesDir, projectId);
+      saveState(hermesDir, projectId, state);
+
+      const thread = new FakeThread();
+      const deps = makeDeps(thread, hermesDir);
+      const out = await softExit(projectId, state, deps, "manual_switch");
+
+      expect(out.status).toBe("killed");
+      expect(out.killedReason).toBe("manual_switch");
+
+      const after = loadState(hermesDir, projectId)!;
+      expect(after.killedReason).toBe("manual_switch");
+      expect(after.timer).toBeUndefined();
+
+      const fs = await import("node:fs");
+      const journal = fs.readFileSync(projectPath(hermesDir, projectId, "journal.log"), "utf8");
+      expect(journal).toContain("manual switch cancelled auto-mode timer");
+      expect(thread.sent[0]).toContain("manual switch");
+    },
+  );
+
+  test(
+    "past deadline: armProjectTimer fires onExpire via queueMicrotask (no setTimeout)",
+    async () => {
+      // This is the M2.5 "bot restart and timer already expired" path:
+      // armProjectTimer sees expiresAt <= now and fires the callback on
+      // the next microtask instead of scheduling a setTimeout. The
+      // callback then sees the project is still active and softExits.
+      const projectId = "p-e2e-past";
+      const state = e2eBaseState(projectId, { status: "judging" });
+      state.timer = {
+        expiresAt: Date.now() - 1_000, // 1s in the past
+        handle: undefined,
+        requestedDuration: "1m",
+        effectiveMs: 60_000,
+        clamped: false,
+      };
+      ensureProjectDir(hermesDir, projectId);
+      saveState(hermesDir, projectId, state);
+
+      const thread = new FakeThread();
+      const armHandle = armProjectTimer(state, () => {
+        const fresh = loadState(hermesDir, projectId);
+        if (!fresh || !isActive(fresh)) return;
+        softExit(projectId, fresh, {
+          hermesDir,
+          thread: thread as unknown as import("discord.js").ThreadChannel,
+          claudeSession: null,
+        }, "duration_expired").catch(() => {});
+      });
+      // Past-deadline arm returns null (no setTimeout was scheduled)
+      expect(armHandle).toBeNull();
+
+      // Yield to the microtask queue + give softExit a tick to run.
+      await new Promise((r) => setImmediate(r));
+      await new Promise((r) => setTimeout(r, 50));
+
+      const after = loadState(hermesDir, projectId)!;
+      expect(after.status).toBe("killed");
+      expect(after.killedReason).toBe("duration_expired");
+      expect(thread.sent.length).toBe(1);
+    },
+  );
 });

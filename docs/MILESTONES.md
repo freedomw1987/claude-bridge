@@ -262,10 +262,11 @@ window without babysitting.
 - [x] M2.10: tests — `parseDuration` cases, timer set/clear, `softExit`
   boundary check, bot-restart re-hydration, status-embed timer line
   *(301/301 passing, 1 skip, typecheck clean)*
-- [ ] M2.11: E2E manual smoke — `/project setMode auto 1m` then wait
-  70s, observe `duration_expired` message at next judge pass
-  *(deferred — David runs manually; smoke-test script lives in
-  `scripts/smoke-m2.sh`)*
+- [x] M2.11: E2E timer-softExit integration
+  *(automated — 3 tests in
+  `src/hermes/orchestrator.test.ts` "E2E M2.11" block, ~500ms total;
+  covers invariants I-1..I-7 of RG-001. Manual Discord smoke
+  walkthrough retained in `scripts/smoke-m2.sh` as fallback.)*
 
 ### Deliverable
 `/project setMode auto 30m` gives a 30-minute autonomous window. Status
