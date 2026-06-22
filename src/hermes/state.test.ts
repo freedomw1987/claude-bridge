@@ -265,10 +265,16 @@ describe("isActive", () => {
     expect(isActive({ status: "judging" } as ProjectState)).toBe(true);
   });
 
-  test("done/failed/killed are not active", () => {
+  test("done/failed/killed/timed_out/parse_error are not active", () => {
     expect(isActive({ status: "done" } as ProjectState)).toBe(false);
     expect(isActive({ status: "failed" } as ProjectState)).toBe(false);
     expect(isActive({ status: "killed" } as ProjectState)).toBe(false);
+    // RG-008
+    expect(isActive({ status: "timed_out" } as ProjectState)).toBe(false);
+    // RG-010: parse_error is terminal (planner output was unparseable),
+    // so isActive must be false. Otherwise /project resume would
+    // accidentally try to re-run a parse-broken planner.
+    expect(isActive({ status: "parse_error" } as ProjectState)).toBe(false);
   });
 });
 

@@ -10,6 +10,9 @@
 |----------|------|---------|---------|------------------------|-----------------|------|
 | RG-001 | `/project setMode auto <duration>` timer integration 嘅 invariant set (M2.4–M2.11, ADR-0004) | 2026-06-22 | Phase 1.5 lock | [see](#rg-001) | `src/hermes/orchestrator.test.ts` E2E block (3 tests) | LOCKED |
 | RG-002 | CC's `<ant_thinking>...</ant_thinking>` blocks leak into Discord if not stripped | 2026-06-22 | v1.1.0 (pre-fix) | [see](#rg-002) | `src/discord/handlers/format.test.ts` (15 tests) + `src/agent/discordTool.test.ts` (3 integration tests) | FIXED |
+| RG-008 | Planner 5min hardcoded timeout + `/project kill` missing `killedReason` + planner crash → opaque "aborted by user" | 2026-06-22 | pre-fix | [see](#rg-008) | `src/discord/handlers/hermesCommands.test.ts` (10) + `src/hermes/orchestratorRG008.test.ts` (2) | FIXED |
+| RG-009 | `/project delete` 缺失 — 9 個 failed/killed projects 無法清理, 只能 `rm -rf` | 2026-06-22 | pre-fix | [see](#rg-009) | `src/discord/handlers/hermesCommandsRG009.test.ts` (15 tests) | FIXED |
+| RG-010 | planner `stripCodeFences` 唔 strip think tags → `JSON.parse` 撞 `<` → opaque "Unrecognized token" | 2026-06-22 | pre-fix | [see](#rg-010) | `src/hermes/plannerRG010.test.ts` (11) + `src/hermes/orchestratorRG008.test.ts` (2) | FIXED |
 
 ---
 
@@ -636,3 +639,127 @@ const escalationMsg = isPlannerTimeout
 - 2026-06-22 紅線 13: 12 個 invariants 全部有對應 lock test, audit trail 完整 (10 喺 `hermesCommands.test.ts`, 2 喺 `orchestratorRG008.test.ts` 因為舊 file 嘅 `mock.module("../../hermes/orchestrator")` 將 `runProject` mock 走, 唔可以直接 call 真 catch block)
 - 2026-06-22 Implementation 經過 4 個 test fix cycles: (1) I-10/I-11 一開始用 `Object.defineProperty` 直接 mutate `plannerModule.planProject` → bun throws "Cannot replace module namespace object's binding", (2) 改用 `await import("./planner")` 後再 defineProperty → 一樣撞牆, (3) 改寫獨立 file `orchestratorRG008.test.ts` 用 `mock()` hoisted + `.mockImplementation()` per test → I-10 first run fail 1 expect (TypingIndicator 嘅 `sendTyping` missing), 加 fake thread method → pass, (4) I-11 fail 1 expect (journal 寫 "Error: " prefix 從 `String(err)`), 改 regex `/orchestrator crash:.*simulated orchestrator crash/` → pass
 - 2026-06-22 Mock module pattern 學到: bun `mock()` function 係 hoisted, 可以喺 top-level declare + 喺 `mock.module("./X", () => ...)` 入面 replace, 然後 per-test 用 `.mockImplementation(...)` 切換行為; 直接 assign to module named export (e.g. `plannerModule.planProject = ...`) 會撞 "module namespace object" TypeError
+
+---
+
+## RG-009: /project delete + cleaning up failed projects (2026-06-22)
+
+### 症狀
+David 喺 `2026-06-22 08:30` 跑 `/project list` 見到 9 個 Hermes project 全部 failed/killed(其中 6 個 0/0 tasks $0.00,係 RG-008 修咗嘅 5min timeout 受害者;另外 1 個 9/10 係 execution phase crash),冇辦法 delete — 只能 `rm -rf` 個 project dir, 但 `rm -rf` 冇 audit trail 又危險, fat-finger 一野可以炸 production。
+
+### Root Cause
+`/project` 個 command set 冇 delete sub-command。9 個 dead project 永遠喺 `/project list` 度 noise, David 揀 project 嘅 experience 嚴重受影響。
+
+### Fix
+- 新 command `/project delete <id|prefix>` 同 `/project delete --all-failed`, 兩階段 commit(Phase 1 = parse + confirm, Phase 2 = `yes`/`no` execute)
+- `state.ts` 加 `deleteProject()`(path-safe `rmSync`, 拒絕 `/` `..` 等)同 `resolveProjectPrefix()`(8-char prefix 解析)
+- Safety: active project 唔可以單個 delete,必須先 `/project kill`;`--all-failed` 永遠 skip active projects
+- Pending delete keyed by `userId` + `channelId`,5 min TTL
+- Audit trail: log 寫 `bot.log`(`hermes: project(s) deleted {userId, kind, deletedCount, ...}`),因為 `journal.log` 已經畀人刪咗
+
+### Invariants Locked (15)
+
+| # | Invariant | Lock test |
+|---|-----------|-----------|
+| I-1 | `matchDelete` parses `/project delete <id>`, `/project delete <full-uuid>`, `/project delete --all-failed`, case-insensitive on keyword | `hermesCommandsRG009.test.ts` I-1 |
+| I-2 | `matchDelete` rejects malformed inputs (no target, multi-token) | I-2 |
+| I-3 | `resolveProjectPrefix` resolves a unique 8-char prefix to full id | I-3 |
+| I-4 | `resolveProjectPrefix` returns null on zero matches | I-4 |
+| I-5 | `resolveProjectPrefix` returns the ambiguous list on multiple matches | I-5 |
+| I-6 | `deleteProject` refuses path-traversal style inputs (`/` `..` shell metachars) | I-6 |
+| I-7 | `deleteProject` is idempotent (false on already-gone dir) | I-7 |
+| I-8 | `handleProjectDelete --all-failed` REFUSES active projects even if user asked for them | I-8 |
+| I-9 | `handleProjectDelete` single-id refuses to delete an active project (must `/project kill` first) | I-9 |
+| I-10 | `handleProjectDelete` on a single-id terminal project sets up a `PendingDelete` (the actual file is still on disk until "yes" arrives) | I-10 |
+| I-11 | `handleDeleteConfirmReply` with "yes" executes the deletion; project dir gone after | I-11 |
+| I-12 | `handleDeleteConfirmReply` with "no" cancels, project survives | I-12 |
+| I-13 | `handleDeleteConfirmReply` returns false on unrelated reply (e.g. "y" / "yeah" / "nope") — falls through to other handlers | I-13 |
+| I-14 | `handleDeleteConfirmReply` is scoped: a "yes" from a different `userId` does NOT trigger the delete | I-14 |
+| I-15 | `handleDeleteConfirmReply` is scoped: a "yes" from a different `channelId` does NOT trigger the delete | I-15 |
+
+### 防止再發
+- [x] **15 RG-009 audit tests** 喺 `hermesCommandsRG009.test.ts` 全部 PASS
+- [x] **All 415 tests pass** (376 之前 + 39 net new = 26 RG-009 + 11 RG-010 + 2 orchestrator I-12/I-13)
+- [x] **TOCTOU 處理**:`handleDeleteConfirmReply` execute-time re-scan status,避免 `/project adopt` 喺 confirm 同 execute 之間 auto-kill 個 project 撞 conflict
+- [x] **冇 user-visible UI = 冇做 守則**:David 嘅 `👀 = 冇做` 鐵律延伸 — 任何 cleanup feature 必須有 `/project delete` + 2 階段 confirm,冇 silent `rm -rf`
+
+### Detection signal (出現以下即 RG-009 走樣)
+- `matchDelete` regex 改咗, 多咗 `;`, `&&`, shell metachar 解析
+- `deleteProject` 改用 `rm -rf` 冇 path safety check → 接受 `/` `..` 之後 `rm -rf` 個 bot data root
+- Pending delete 冇 userId/channelId scope → 任何 user "yes" 都可以 trigger 刪除
+- `--all-failed` 冇 skip active projects → 一個 `/project delete --all-failed` 可以炸走 active production project
+
+---
+
+## RG-010: planner JSON.parse 撞 `<` 因為 stripCodeFences 冇 strip think tags (2026-06-22)
+
+### 症狀
+David 喺 `2026-06-22 08:01` 喺新 Discord thread 跑 `/project adopt "完成這個項目的開發"`,1 分鐘後收到:
+```
+⚠️ escalated: orchestrator crashed: Error: planner: invalid JSON
+response: SyntaxError: JSON Parse error: Unrecognized token '<' — reply or
+```
+
+### Root Cause
+planner LLM (MiniMax-M3 / cheap model) 喺 plan output 前 emit 一段 ` ` block 然後先至 wrap 個 JSON 喺 ` ```json...``` ` fence 入面。我哋 `stripCodeFences` 只 strip fence, 唔 strip thinking tags, 結果 cleaned string 開頭係 `<`,`JSON.parse` 撞 SyntaxError。
+
+Pre-RG-010 個 parse path 係:
+```ts
+function stripCodeFences(s) {
+  return s.replace(/^\s*```(?:json)?\s*/i, "")
+          .replace(/```\s*$/i, "")
+          .trim();
+}
+JSON.parse(cleaned)  // 撞 `<` 死
+```
+
+### Fix
+1. `stripCodeFences` 加 `stripThinkTags` 做第一步(用返 `format.ts` 已有嘅 helper,避免重複 regex):
+   ```ts
+   function stripCodeFences(s) {
+     return stripThinkTags(s)
+       .replace(/^\s*```(?:json)?\s*/i, "")
+       .replace(/```\s*$/i, "")
+       .trim();
+   }
+   ```
+2. 新 `PlannerParseError` class(類似 `PlannerTimeoutError`),carry `raw` + `cleaned` + `cause`
+3. `ProjectStatus` 加 `"parse_error"` variant
+4. `isActive` 唔變(`parse_error` 係 terminal state, 同 `failed`/`killed`/`timed_out`)
+5. `orchestrator.ts` catch block 加分流:`instanceof PlannerParseError` → `status="parse_error"` + `"🔧 planner output was unparseable"` escalation
+6. `handleProjectResume` 接受 `parse_error` 為 resumable(planner retry 可能成功第二次)
+
+### Invariants Locked (11)
+
+| # | Invariant | Lock test |
+|---|-----------|-----------|
+| I-1 | `stripCodeFences` strips ` ` blocks | `plannerRG010.test.ts` I-1 |
+| I-2 | `stripCodeFences` strips ` ` blocks | I-2 |
+| I-3 | `stripCodeFences` strips short-form ` ` variant | I-3 |
+| I-4 | The actual regression input (thinking + fence) is fully cleaned (valid JSON) | I-4 |
+| I-5 | `stripCodeFences` is idempotent (no double-stripping) | I-5 |
+| I-6 | `stripCodeFences` returns plain JSON unchanged | I-6 |
+| I-7 | `stripCodeFences` handles missing opening fence (model wrote plain JSON) | I-7 |
+| I-8 | `PlannerParseError` carries raw output, cleaned output, and cause | I-8 |
+| I-9 | `PlannerParseError` is an `instanceof Error` | I-9 |
+| I-10 | `PlannerParseError.message` starts with "planner: invalid JSON" (for log grep) | I-10 |
+| I-11 | `PlannerParseError` is recognized as parse failure in orchestrator status mapping | I-11 |
+| I-12 | `instanceof PlannerParseError` → `status="parse_error"` + `"🔧"` escalation + raw output in journal | `orchestratorRG008.test.ts` RG-010 I-12 |
+| I-13 | `PlannerParseError` is NOT misclassified as `timed_out` (regression guard) | RG-010 I-13 |
+
+### 防止再發
+- [x] **11 RG-010 audit tests** 喺 `plannerRG010.test.ts` 全部 PASS
+- [x] **2 RG-010 orchestrator tests** 喺 `orchestratorRG008.test.ts` I-12/I-13 全部 PASS
+- [x] **isActive smoke test** 加咗 `parse_error` 喺 `state.test.ts` 嘅 terminal list
+- [x] **System prompt 唔改**:即使 system prompt 講 "JSON only", thinking models 都可以 leak — strip 係 defense-in-depth, 唔可以 rely on prompt alone
+
+### Detection signal (出現以下即 RG-010 走樣)
+- Discord escalation 仲寫 "orchestrator crashed: Error: planner: invalid JSON response: SyntaxError: Unrecognized token '<'" — `instanceof PlannerParseError` 嘅分流失效
+- `state.json` 嘅 `status` 寫 "failed" 但 journal 寫 "planner output was unparseable" — 個 catch 嘅 ternary 拎咗 wrong branch
+- `stripCodeFences` 唔 call `stripThinkTags` — 個新 fix 退返 pre-RG-010 行為
+- `stripThinkTags` regex 改咗但 `planner.ts` 漏 import — 個 strip 唔 strip 嘢
+- `parse_error` 喺 `ProjectStatus` union 唔見咗 — TypeScript 編譯失敗 / 個 status 字串 literal mismatch
+
+### 相關 Discussion
+- 2026-06-22 David 揀 B = "RG-009 + RG-010 同步修, 1 個 commit ship" — 兩個 issue 互 independent, ship 埋一齊可以 1 個 restart 解決
+- 2026-06-22 80555888 嘅 9/10 execution crash 唔係 RG-010 真兇(planner 嗰 9 個 task 已經成功 plan 出嚟),係另一個 execution phase bug, **out of scope** 喺呢個 PR

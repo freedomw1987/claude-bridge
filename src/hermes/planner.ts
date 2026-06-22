@@ -17,7 +17,44 @@ import { query, type SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 import { config } from "../config";
 import { log } from "../logger";
 import { z } from "zod";
+import { stripThinkTags } from "../discord/handlers/format";
 import type { Task } from "./types";
+
+/**
+ * RG-010 (regression 2026-06-22): the planner LLM (MiniMax-M3 /
+ * cheap model) sometimes emits a ` ` block in its
+ * response, then wraps the JSON in `\`\`\`json...\`\`\`` fences. The
+ * previous `stripCodeFences` only stripped the fences, leaving the
+ * `
+ * ` tags intact, so `JSON.parse` choked on the leading `<` with
+ * `SyntaxError: JSON Parse error: Unrecognized token '<'`.
+ *
+ * Fix: strip thinking blocks FIRST (before fence stripping), so the
+ * remaining string starts at the opening `\`\`\`` and parses cleanly.
+ * If the cleaned string is still not parseable, throw a
+ * `PlannerParseError` (subclass of Error) with the first 500 chars
+ * of the raw output for debug. The orchestrator catches this and
+ * transitions the project to status="parse_error" with a clean
+ * escalation message — distinct from a generic failure and from a
+ * timeout (RG-008).
+ *
+ * We do NOT change the planner system prompt in this fix because
+ * even with the JSON-only directive, thinking models can still leak
+ * their thought process before the JSON. The strip is the
+ * defense-in-depth.
+ */
+export class PlannerParseError extends Error {
+  readonly raw: string;
+  readonly cleaned: string;
+  readonly cause: unknown;
+  constructor(opts: { raw: string; cleaned: string; cause: unknown }) {
+    super(`planner: invalid JSON response: ${String(opts.cause)}`);
+    this.name = "PlannerParseError";
+    this.raw = opts.raw;
+    this.cleaned = opts.cleaned;
+    this.cause = opts.cause;
+  }
+}
 
 /**
  * RG-008 (regression 2026-06-22): the previous hardcoded 5-minute
@@ -87,9 +124,28 @@ Rules:
 - First task should set up the workspace (init project, explore existing repo, etc.) when the project is new.
 - Final task should verify the whole deliverable (run tests, typecheck, smoke test).`;
 
-/** Strip markdown code fences if the LLM wrapped JSON in them anyway. */
-function stripCodeFences(s: string): string {
-  return s
+/**
+ * RG-010: strip the LLM response before JSON.parse.
+ *
+ * Order matters:
+ *   1. stripThinkTags  — remove any ` ` blocks
+ *      (MiniMax-M3 leaks them even when the system prompt says
+ *      "JSON only").
+ *   2. strip code fences — remove the `\`\`\`json` / `\`\`\`` wrapping
+ *      that the LLM is supposed to use (and which Anthropic's
+ *      system prompt may encourage defensively).
+ *   3. trim whitespace.
+ *
+ * Pre-RG-010 the function only did step 2, so the JSON.parse would
+ * fail on `<` if the model emitted thinking tags. See PlannerParseError
+ * above for the post-parse fallback.
+ *
+ * Exported for unit testing (plannerRG010.test.ts) — the actual
+ * `planProject` function is end-to-end tested only via the bot's
+ * live integration, so the strip function is the testable seam.
+ */
+export function stripCodeFences(s: string): string {
+  return stripThinkTags(s)
     .replace(/^\s*```(?:json)?\s*/i, "")
     .replace(/```\s*$/i, "")
     .trim();
@@ -197,11 +253,21 @@ Decompose the goal into 3-10 concrete tasks. Return JSON only.`;
   try {
     parsed = PLAN_RESPONSE_SCHEMA.parse(JSON.parse(cleaned));
   } catch (err) {
+    // RG-010: throw a typed PlannerParseError so the orchestrator
+    // can transition the project to status="parse_error" with a
+    // clear escalation message. We preserve the first 500 chars of
+    // the raw LLM output so the failure is debuggable from the
+    // project journal later.
     log.error("hermes planner: parse failed", {
-      raw: cleaned.slice(0, 1000),
+      raw: collected.slice(0, 1000),
+      cleaned: cleaned.slice(0, 1000),
       err: String(err),
     });
-    throw new Error(`planner: invalid JSON response: ${String(err)}`);
+    throw new PlannerParseError({
+      raw: collected.slice(0, 500),
+      cleaned: cleaned.slice(0, 500),
+      cause: err,
+    });
   }
 
   // Validate dependsOn DAG.

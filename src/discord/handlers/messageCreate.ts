@@ -30,7 +30,10 @@ import type { SessionStore } from "../../db";
 import type { ProjectRegistry } from "../../projects/registry";
 import { sendHelp, EMPTY_PROMPT_TEXT, NO_TARGET_TEXT, NO_SESSION_TEXT } from "../help";
 import { dispatchCommand } from "./commands";
-import { dispatchHermesCommand } from "./hermesCommands";
+import {
+  dispatchHermesCommand,
+  handleDeleteConfirmReply,
+} from "./hermesCommands";
 import { ensureRepoReady } from "./targets";
 import { forwardToClaude } from "./streaming";
 
@@ -86,6 +89,14 @@ export async function handleMessageCreate(
   });
 
   const botUserId = msg.client.user!.id;
+
+  // RG-009 phase 2: handle yes/no confirmation replies for
+  // /project delete. Must run before the /project dispatch
+  // (which would otherwise treat "yes" as a non-/project command
+  // and fall through) and before the thread-session check (a
+  // delete confirmation can be sent at top level).
+  const confirmHandled = await handleDeleteConfirmReply(msg);
+  if (confirmHandled) return;
 
   // Hermes /project commands take precedence over @bot mention handling.
   // /project start works at top level (no @bot mention needed); other

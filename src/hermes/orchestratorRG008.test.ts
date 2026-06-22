@@ -61,7 +61,7 @@ mock.module("./planner", () => {
 // that the orchestrator's `import { planProject }` is bound to the
 // mock at module-load time.
 import { runProject } from "./orchestrator";
-import { PlannerTimeoutError } from "./planner";
+import { PlannerParseError, PlannerTimeoutError } from "./planner";
 
 // ── Test fakes ──────────────────────────────────────────────────────────
 
@@ -200,5 +200,94 @@ describe("RG-008b: orchestrator catch block (real runProject)", () => {
     const journalPath = join(hermesDir, "projects", project.id, "journal.log");
     const journal = readFileSync(journalPath, "utf-8");
     expect(journal).toMatch(/\[escalate\] orchestrator crash:.*simulated orchestrator crash/);
+  });
+
+  // RG-010 I-12: PlannerParseError → status="parse_error" + "🔧" escalation.
+  // The regression 2026-06-22 was that an LLM-leaked thinking block made
+  // JSON.parse throw, which previously fell into the generic "failed"
+  // path with the opaque "planner: invalid JSON response: SyntaxError:
+  // Unrecognized token '<'" message. The new branch preserves the raw
+  // output in the journal for debug.
+  test("RG-010 I-12: PlannerParseError → status='parse_error' + '🔧' escalation + raw output in journal", async () => {
+    ensureProjectDir(hermesDir, project.id);
+    saveState(hermesDir, project.id, project);
+
+    const rawSample =
+      "\nThe user wants me to decompose a goal into tasks.\nLet me think about this carefully.\nOK I think 2 tasks are enough.\n```json\n{not actually json}\n```";
+    planProjectMock.mockImplementation(async () => {
+      throw new PlannerParseError({
+        raw: rawSample,
+        cleaned: "{not actually json}",
+        cause: new SyntaxError("Unrecognized token"),
+      });
+    });
+
+    await runProject(project.id, {
+      hermesDir,
+      thread: thread as unknown as ThreadChannel,
+      claudeSession: null,
+    });
+
+    // Status must be parse_error (not failed, not timed_out).
+    const reloaded = loadState(hermesDir, project.id);
+    expect(reloaded).not.toBeNull();
+    expect(reloaded!.status).toBe("parse_error");
+    expect(reloaded!.endedAt).not.toBeNull();
+
+    // Escalation must use the new "🔧 planner output was unparseable"
+    // path, NOT the old "orchestrator crashed" path.
+    const escalation = thread.sent.find((s) => s.includes("escalated"));
+    expect(escalation).toBeDefined();
+    expect(escalation!).toContain("🔧");
+    expect(escalation!).toContain("planner output was unparseable");
+    // Must NOT contain the old "🕐" timeout prefix (otherwise the
+    // new branch would leak into the timeout path) or the old
+    // "orchestrator crashed" generic path.
+    expect(escalation).not.toContain("🕐");
+    expect(escalation).not.toContain("orchestrator crashed:");
+
+    // Journal must preserve the raw LLM output (up to 500 chars) so
+    // the failure is debuggable from the project thread.
+    const journalPath = join(hermesDir, "projects", project.id, "journal.log");
+    const journal = readFileSync(journalPath, "utf-8");
+    expect(journal).toMatch(/\[escalate\] planner output was unparseable/);
+    // The raw output should be JSON-stringified in the journal, so
+    // newlines become \n escapes. We check for a substring that's
+    // present regardless of the truncation boundary.
+    expect(journal).toContain("not actually json");
+  });
+
+  // RG-010 I-13: regression guard — a PlannerParseError must NOT be
+  // misclassified as a PlannerTimeoutError (status would otherwise
+  // be "timed_out" instead of "parse_error"). The two branches are
+  // siblings in the catch, and the order of `instanceof` checks
+  // matters: PlannerParseError must be checked BEFORE the generic
+  // Error fallback. We verify by checking the status and the
+  // escalation token ("🔧" not "🕐").
+  test("RG-010 I-13: PlannerParseError is NOT misclassified as timed_out", async () => {
+    ensureProjectDir(hermesDir, project.id);
+    saveState(hermesDir, project.id, project);
+    planProjectMock.mockImplementation(async () => {
+      throw new PlannerParseError({
+        raw: "x",
+        cleaned: "y",
+        cause: new SyntaxError("Unrecognized token"),
+      });
+    });
+
+    await runProject(project.id, {
+      hermesDir,
+      thread: thread as unknown as ThreadChannel,
+      claudeSession: null,
+    });
+
+    const reloaded = loadState(hermesDir, project.id);
+    expect(reloaded!.status).toBe("parse_error");
+    expect(reloaded!.status).not.toBe("timed_out");
+    expect(reloaded!.status).not.toBe("failed");
+
+    const escalation = thread.sent.find((s) => s.includes("escalated"));
+    expect(escalation!).not.toContain("🕐");
+    expect(escalation!).toContain("🔧");
   });
 });

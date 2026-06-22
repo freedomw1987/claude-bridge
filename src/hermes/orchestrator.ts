@@ -27,7 +27,11 @@
 import { runViaSdk, type SdkRunResult } from "../agent/sdkRunner";
 import { log } from "../logger";
 import { executeTask, type ExecutorDeps } from "./executor";
-import { PlannerTimeoutError, planProject } from "./planner";
+import {
+  PlannerParseError,
+  PlannerTimeoutError,
+  planProject,
+} from "./planner";
 import { judgeProject } from "./judge";
 import {
   appendJournal,
@@ -238,18 +242,40 @@ export async function runProject(
     // "orchestrator crashed: Claude Code process aborted by user"
     // string we used to see (regression 2026-06-22, 6/6 of the
     // failed projects in /project list exhibited this).
+    //
+    // RG-010: similarly distinguish planner parse failure (LLM leaked
+    // thinking tags, malformed JSON, etc.) into a `parse_error`
+    // status. Without this, the project would land on the generic
+    // `failed` state with the same opaque "planner: invalid JSON
+    // response: SyntaxError: Unrecognized token '<'" message.
     const isPlannerTimeout = err instanceof PlannerTimeoutError;
-    state.status = isPlannerTimeout ? "timed_out" : "failed";
+    const isPlannerParseError = err instanceof PlannerParseError;
+    state.status = isPlannerTimeout
+      ? "timed_out"
+      : isPlannerParseError
+      ? "parse_error"
+      : "failed";
     state.endedAt = new Date().toISOString();
     saveState(deps.hermesDir, projectId, state);
+    // Preserve the raw LLM output in the journal so the failure
+    // is debuggable from the project thread without re-running
+    // the planner. Cap at 500 chars to keep the journal readable.
+    const rawSnippet =
+      isPlannerParseError && err instanceof PlannerParseError
+        ? err.raw.slice(0, 500)
+        : null;
     appendJournal(deps.hermesDir, projectId, {
       type: "escalate",
       message: isPlannerTimeout
-        ? `planner timed out after ${Math.round(err.timeoutMs / 1000)}s; project ${state.id.slice(0, 8)} ended in timed_out`
+        ? `planner timed out after ${Math.round((err as PlannerTimeoutError).timeoutMs / 1000)}s; project ${state.id.slice(0, 8)} ended in timed_out`
+        : isPlannerParseError
+        ? `planner output was unparseable as JSON; project ${state.id.slice(0, 8)} ended in parse_error. raw=${JSON.stringify(rawSnippet)}`
         : `orchestrator crash: ${String(err).slice(0, 300)}`,
     });
     const escalationMsg = isPlannerTimeout
-      ? `🕐 planner timed out after ${Math.round(err.timeoutMs / 1000)}s — goal was too complex for the planner LLM. Try /project resume with HERMES_PLANNER_TIMEOUT_MS raised, or split the goal.`
+      ? `🕐 planner timed out after ${Math.round((err as PlannerTimeoutError).timeoutMs / 1000)}s — goal was too complex for the planner LLM. Try /project resume with HERMES_PLANNER_TIMEOUT_MS raised, or split the goal.`
+      : isPlannerParseError
+      ? `🔧 planner output was unparseable as JSON — the LLM leaked thinking tags or returned malformed JSON. The raw output is in the project journal for inspection. Try /project resume to retry the planner, or simplify the goal.`
       : `orchestrator crashed: ${String(err).slice(0, 200)}`;
     await send(formatEscalation(state, escalationMsg));
   } finally {

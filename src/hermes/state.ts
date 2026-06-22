@@ -21,6 +21,7 @@ import {
   appendFileSync,
   mkdirSync,
   readdirSync,
+  rmSync,
   unlinkSync,
 } from "node:fs";
 import { join } from "node:path";
@@ -219,6 +220,74 @@ export function listProjects(
     out.push(state);
   }
   return out;
+}
+
+/**
+ * RG-009: Permanently delete a project directory from disk.
+ *
+ * Used by `/project delete <id>` and `/project delete --all-failed`.
+ * Removes the entire `<hermesDir>/projects/<projectId>/` subtree
+ * (state.json, journal.log, plan.md, artifacts/) so a follow-up
+ * `/project list` no longer surfaces the project.
+ *
+ * Safety:
+ *   - `projectId` MUST be a bare UUID with no `/` or `..` segments.
+ *     Anything else is rejected with `false` (no deletion occurs).
+ *     The `existsSync` precheck is defensive against race conditions
+ *     (project already deleted by another path) — returning `false`
+ *     in that case is benign and idempotent.
+ *   - This is intentionally NOT recoverable. Callers must obtain
+ *     confirmation before invoking. The audit trail is the bot log
+ *     (`logger.log.info("hermes: project deleted", ...)`) since the
+ *     project's own journal.log is removed along with the rest of
+ *     the directory.
+ *
+ * Returns `true` if the project dir existed and was removed, `false`
+ * if it did not exist (or if the projectId was rejected by the
+ * safety check).
+ */
+export function deleteProject(
+  hermesDir: string,
+  projectId: string,
+): boolean {
+  // Safety: reject anything that isn't a bare identifier (no
+  // slashes, no whitespace, no shell metacharacters). Hermes
+  // project IDs are normally RFC 4122 UUIDs (lowercase hex +
+  // dashes) but test fixtures use prefixed UUIDs like
+  // `rg009-I8A5cf...` so we accept any string of safe characters
+  // (alphanumeric + dash + underscore) to be permissive.
+  if (!/^[0-9a-zA-Z_-]+$/.test(projectId)) return false;
+  const dir = projectDir(hermesDir, projectId);
+  if (!existsSync(dir)) return false;
+  rmSync(dir, { recursive: true, force: true });
+  return true;
+}
+
+/**
+ * RG-009: Resolve a (possibly 8-char) project id prefix to a full
+ * projectId. If exactly one project's id starts with `prefix`,
+ * returns that projectId. If zero match, returns null. If multiple
+ * match (ambiguous), returns a special sentinel — caller's
+ * responsibility to handle.
+ *
+ * The sentinel is an empty string (returned as `{ ambiguous: true,
+ * matches: string[] }`), so the caller can disambiguate without
+ * touching extra state.
+ */
+export function resolveProjectPrefix(
+  hermesDir: string,
+  prefix: string,
+): { projectId: string | null; ambiguous: string[] } {
+  if (prefix.length < 4) return { projectId: null, ambiguous: [] };
+  const projectsRoot = join(hermesDir, "projects");
+  if (!existsSync(projectsRoot)) return { projectId: null, ambiguous: [] };
+  const matches: string[] = [];
+  for (const entry of readdirSync(projectsRoot)) {
+    if (entry.startsWith(prefix)) matches.push(entry);
+  }
+  if (matches.length === 0) return { projectId: null, ambiguous: [] };
+  if (matches.length === 1) return { projectId: matches[0], ambiguous: [] };
+  return { projectId: null, ambiguous: matches };
 }
 
 /**
