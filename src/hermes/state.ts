@@ -30,7 +30,47 @@ import {
   type JournalEntry,
   type JournalEntryType,
   type ProjectState,
+  type ProjectTimer,
 } from "./types";
+
+// ── Timer handle hygiene (ADR-0004) ──────────────────────────────────
+//
+// `ProjectTimer.handle` is a NodeJS Timeout reference — process-local and
+// NOT serializable. NodeJS Timeouts have no own enumerable props, so
+// `JSON.stringify(handle)` produces `{}` (not `undefined`), and the field
+// would round-trip as a phantom `{}` on disk. We strip it explicitly in
+// saveState and re-create it from `expiresAt` in loadState (the latter
+// happens in index.ts's resumeActiveProjects, not here — we don't want
+// loadState to spawn side-effect timers on a plain disk read).
+//
+// The pattern below (immutable struct -> strip -> JSON.stringify) keeps
+// the in-memory `state.timer.handle` reference intact for the running
+// orchestrator while writing a clean `state.json` to disk.
+
+/**
+ * Return a deep-clone of `state` with `state.timer.handle` removed.
+ * The in-memory `state` object is NOT mutated — callers can keep using
+ * the live handle reference after saveState returns.
+ */
+export function stripTimerHandle(state: ProjectState): ProjectState {
+  if (!state.timer) return state;
+  const { handle: _h, ...persistable } = state.timer;
+  void _h; // explicitly discarded
+  return { ...state, timer: persistable };
+}
+
+/**
+ * Clear the timer field entirely (used on terminal transition, manual
+ * switch, or `/project kill`). Returns a new state object; the input
+ * is not mutated.
+ */
+export function clearTimer(state: ProjectState): ProjectState {
+  if (!state.timer) return state;
+  // Drop the field entirely (don't leave a handle-less timer behind).
+  const { timer: _t, ...without } = state;
+  void _t;
+  return without as ProjectState;
+}
 
 export function projectDir(hermesDir: string, projectId: string): string {
   return join(hermesDir, "projects", projectId);
@@ -62,7 +102,11 @@ export function saveState(
   const dir = projectDir(hermesDir, projectId);
   const target = join(dir, "state.json");
   const tmp = join(dir, "state.json.tmp");
-  const json = JSON.stringify(state, null, 2);
+  // ADR-0004: strip ProjectTimer.handle (process-local Timeout) before
+  // serialization. The in-memory `state` keeps its live handle for the
+  // orchestrator; only the disk copy is filtered.
+  const persistable = stripTimerHandle(state);
+  const json = JSON.stringify(persistable, null, 2);
   try {
     writeFileSync(tmp, json);
     renameSync(tmp, target);
@@ -99,6 +143,14 @@ export function loadState(
       } catch {
         // ignore
       }
+    }
+    // ADR-0004: a disk-read state should never carry a handle. If we somehow
+    // loaded one (older buggy snapshot?), drop it. Re-arming the timer is
+    // the caller's job (see index.ts:resumeActiveProjects).
+    if (parsed.timer?.handle !== undefined) {
+      const { handle: _h, ...timerNoHandle } = parsed.timer;
+      void _h;
+      parsed.timer = timerNoHandle as ProjectTimer;
     }
     return parsed;
   } catch (err) {

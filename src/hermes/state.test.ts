@@ -4,17 +4,19 @@
  */
 
 import { describe, test, expect, beforeEach, afterEach } from "bun:test";
-import { mkdtempSync, rmSync, readFileSync, existsSync } from "node:fs";
+import { mkdtempSync, rmSync, readFileSync, writeFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   appendJournal,
+  clearTimer,
   ensureProjectDir,
   listProjects,
   loadState,
   projectDir,
   resolveHermesDir,
   saveState,
+  stripTimerHandle,
 } from "./state";
 import {
   DEFAULT_HERMES_CONFIG,
@@ -26,6 +28,18 @@ import {
 let tmpRoot: string;
 let hermesDir: string;
 let projectId: string;
+
+function baseState(): ProjectState {
+  return newProjectState({
+    id: "p",
+    threadId: "t",
+    goal: "g",
+    mode: "auto",
+    repoPath: "/r",
+    repoSource: "new",
+    config: DEFAULT_HERMES_CONFIG,
+  });
+}
 
 beforeEach(() => {
   tmpRoot = mkdtempSync(join(tmpdir(), "hermes-state-"));
@@ -250,5 +264,181 @@ describe("isActive", () => {
     expect(isActive({ status: "done" } as ProjectState)).toBe(false);
     expect(isActive({ status: "failed" } as ProjectState)).toBe(false);
     expect(isActive({ status: "killed" } as ProjectState)).toBe(false);
+  });
+});
+
+// ── Timer handle hygiene (M2.3 / ADR-0004) ─────────────────────────
+
+describe("stripTimerHandle", () => {
+  test("returns input unchanged when no timer is set", () => {
+    const s = baseState();
+    expect(stripTimerHandle(s)).toBe(s); // identity, no copy
+  });
+
+  test("removes handle from a timer-equipped state, keeps the rest", () => {
+    const s = baseState();
+    s.timer = {
+      expiresAt: 1_700_000_000_000,
+      handle: setTimeout(() => {}, 1) as unknown as ReturnType<typeof setTimeout>,
+      requestedDuration: "30m",
+      effectiveMs: 1_800_000,
+      clamped: false,
+    };
+    const stripped = stripTimerHandle(s);
+    expect(stripped.timer).toBeDefined();
+    expect(stripped.timer!.handle).toBeUndefined();
+    expect(stripped.timer!.expiresAt).toBe(1_700_000_000_000);
+    expect(stripped.timer!.requestedDuration).toBe("30m");
+    expect(stripped.timer!.effectiveMs).toBe(1_800_000);
+    expect(stripped.timer!.clamped).toBe(false);
+  });
+
+  test("does not mutate the input state's timer.handle", () => {
+    const s = baseState();
+    const handle = setTimeout(() => {}, 1) as unknown as ReturnType<
+      typeof setTimeout
+    >;
+    s.timer = {
+      expiresAt: 1_700_000_000_000,
+      handle,
+      requestedDuration: "1h",
+      effectiveMs: 3_600_000,
+      clamped: false,
+    };
+    const stripped = stripTimerHandle(s);
+    // Original still has its live handle (orchestrator keeps using it).
+    expect(s.timer!.handle).toBe(handle);
+    expect(stripped.timer!.handle).toBeUndefined();
+    // Identity is broken (we returned a new object).
+    expect(stripped).not.toBe(s);
+  });
+});
+
+describe("clearTimer", () => {
+  test("returns input unchanged when no timer is set", () => {
+    const s = baseState();
+    expect(clearTimer(s)).toBe(s);
+  });
+
+  test("drops the entire timer field (no handle-less zombie)", () => {
+    const s = baseState();
+    s.timer = {
+      expiresAt: 1_700_000_000_000,
+      handle: undefined,
+      requestedDuration: "30m",
+      effectiveMs: 1_800_000,
+      clamped: false,
+    };
+    const cleared = clearTimer(s);
+    expect(cleared.timer).toBeUndefined();
+    expect(s.timer).toBeDefined(); // input not mutated
+  });
+
+  test("drops timer even when handle is live (no leak)", () => {
+    const s = baseState();
+    s.timer = {
+      expiresAt: 1_700_000_000_000,
+      handle: setTimeout(() => {}, 1) as unknown as ReturnType<typeof setTimeout>,
+      requestedDuration: "1h",
+      effectiveMs: 3_600_000,
+      clamped: false,
+    };
+    const cleared = clearTimer(s);
+    expect(cleared.timer).toBeUndefined();
+  });
+});
+
+describe("saveState / loadState — timer round-trip (M2.3)", () => {
+  test("saveState strips timer.handle from disk copy, keeps in-memory live", () => {
+    const s = baseState();
+    const handle = setTimeout(() => {}, 60_000) as unknown as ReturnType<
+      typeof setTimeout
+    >;
+    s.timer = {
+      expiresAt: Date.now() + 30 * 60 * 1000,
+      handle,
+      requestedDuration: "30m",
+      effectiveMs: 1_800_000,
+      clamped: false,
+    };
+    ensureProjectDir(hermesDir, projectId);
+    saveState(hermesDir, projectId, s);
+
+    // In-memory state still has its live handle (orchestrator keeps it).
+    expect(s.timer!.handle).toBe(handle);
+
+    // Disk copy does NOT have the handle.
+    const onDisk = JSON.parse(
+      readFileSync(join(projectDir(hermesDir, projectId), "state.json"), "utf8"),
+    ) as ProjectState;
+    expect(onDisk.timer).toBeDefined();
+    expect(onDisk.timer!.handle).toBeUndefined();
+    expect(onDisk.timer!.expiresAt).toBe(s.timer.expiresAt);
+    expect(onDisk.timer!.requestedDuration).toBe("30m");
+    expect(onDisk.timer!.effectiveMs).toBe(1_800_000);
+    expect(onDisk.timer!.clamped).toBe(false);
+  });
+
+  test("loadState returns a state with no handle even if disk had one (defensive)", () => {
+    // Simulate a legacy / buggy snapshot where handle is `{}` (the bug
+    // we pinned in types.test.ts). The loader should drop it.
+    const dir = projectDir(hermesDir, projectId);
+    ensureProjectDir(hermesDir, projectId);
+    const legacy = {
+      ...baseState(),
+      timer: {
+        expiresAt: 1_700_000_000_000,
+        handle: {}, // the bug snapshot
+        requestedDuration: "30m",
+        effectiveMs: 1_800_000,
+        clamped: false,
+      },
+    };
+    writeFileSync(
+      join(dir, "state.json"),
+      JSON.stringify(legacy, null, 2),
+    );
+    const loaded = loadState(hermesDir, projectId);
+    expect(loaded).not.toBeNull();
+    expect(loaded!.timer).toBeDefined();
+    expect(loaded!.timer!.handle).toBeUndefined();
+    expect(loaded!.timer!.expiresAt).toBe(1_700_000_000_000);
+  });
+
+  test("loadState of state with no timer returns state with no timer", () => {
+    const s = baseState();
+    ensureProjectDir(hermesDir, projectId);
+    saveState(hermesDir, projectId, s);
+    const loaded = loadState(hermesDir, projectId);
+    expect(loaded!.timer).toBeUndefined();
+  });
+
+  test("saveState with cleared timer writes no timer field at all", () => {
+    const s = baseState();
+    s.timer = {
+      expiresAt: 1_700_000_000_000,
+      handle: undefined,
+      requestedDuration: "30m",
+      effectiveMs: 1_800_000,
+      clamped: false,
+    };
+    ensureProjectDir(hermesDir, projectId);
+    saveState(hermesDir, projectId, clearTimer(s));
+    const onDisk = JSON.parse(
+      readFileSync(join(projectDir(hermesDir, projectId), "state.json"), "utf8"),
+    ) as ProjectState;
+    expect(onDisk.timer).toBeUndefined();
+  });
+
+  test("saveState preserves killedReason across round-trip", () => {
+    const s = baseState();
+    s.status = "killed";
+    s.killedReason = "duration_expired";
+    s.endedAt = new Date().toISOString();
+    ensureProjectDir(hermesDir, projectId);
+    saveState(hermesDir, projectId, s);
+    const loaded = loadState(hermesDir, projectId);
+    expect(loaded!.killedReason).toBe("duration_expired");
+    expect(loaded!.status).toBe("killed");
   });
 });
