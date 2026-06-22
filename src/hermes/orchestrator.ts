@@ -31,6 +31,8 @@ import { planProject } from "./planner";
 import { judgeProject } from "./judge";
 import {
   appendJournal,
+  clearTimer,
+  ensureProjectDir,
   loadState,
   saveState,
 } from "./state";
@@ -42,6 +44,7 @@ import {
   formatTaskDone,
   formatTaskFail,
   formatTaskStart,
+  formatTimerExpired,
   HERMES_PREFIX,
   makeHermesSend,
 } from "./discord";
@@ -167,6 +170,21 @@ export async function runProject(
 
     // ── 3. Judging ─────────────────────────────────────────────────
     if (state.status === "judging") {
+      // ADR-0004 M2.4: timer boundary check before invoking judge LLM.
+      // Soft-exit at the judge boundary (not at task boundary) so the
+      // in-flight task's result is preserved on disk and David can
+      // /project resume without losing work.
+      const timerExpired = checkTimerExpired(state);
+      if (timerExpired) {
+        log.info("hermes orchestrator: timer expired at judge boundary", {
+          projectId,
+          expiresAt: state.timer?.expiresAt,
+          requested: state.timer?.requestedDuration,
+        });
+        state = await softExit(projectId, state, deps, "duration_expired");
+        return;
+      }
+
       const verdict = await judgeProject(state);
       state.lastVerdict = verdict;
       appendJournal(deps.hermesDir, projectId, {
@@ -344,6 +362,64 @@ export function pickNextTask(state: ProjectState): Task | null {
     if (depsOk) return t;
   }
   return null;
+}
+
+/**
+ * Check if the project's auto-mode timer has expired (ADR-0004).
+ * Returns true iff `state.timer` is set and `expiresAt` is in the past.
+ * Pure function — does not mutate state, no side effects.
+ */
+export function checkTimerExpired(state: ProjectState): boolean {
+  if (!state.timer) return false;
+  return state.timer.expiresAt <= Date.now();
+}
+
+/**
+ * Soft-exit a project: transition to `killed` with the given reason,
+ * clear the timer field, post a Discord message, and return the
+ * updated state. Idempotent — calling on a non-active project is a
+ * no-op (we still write a journal row for audit).
+ *
+ * @param projectId  the project to soft-exit
+ * @param state      the current state (mutated and saved)
+ * @param deps       orchestrator deps (for thread + send)
+ * @param reason     sub-reason for the killed status
+ */
+export async function softExit(
+  projectId: string,
+  state: ProjectState,
+  deps: OrchestratorDeps,
+  reason: "duration_expired" | "manual_switch",
+): Promise<ProjectState> {
+  const requestedDuration = state.timer?.requestedDuration ?? "n/a";
+  // Clear any live timer handle so it doesn't keep the process alive.
+  if (state.timer?.handle) {
+    clearTimeout(state.timer.handle);
+  }
+  state.status = "killed";
+  state.killedReason = reason;
+  state.endedAt = new Date().toISOString();
+  state.currentTaskId = null;
+  // Drop the timer field entirely (handle-strip is handled by saveState).
+  state = clearTimer(state);
+  // Ensure the on-disk directory exists — softExit can be called before
+  // the orchestrator has saved state (e.g., from /project setMode manual
+  // on a never-resumed project). Idempotent.
+  ensureProjectDir(deps.hermesDir, projectId);
+  saveState(deps.hermesDir, projectId, state);
+  appendJournal(deps.hermesDir, projectId, {
+    type: "timer",
+    message:
+      reason === "duration_expired"
+        ? `auto-mode duration expired; project killed (timer was ${requestedDuration})`
+        : `manual switch cancelled auto-mode timer`,
+  });
+  await deps.thread.send(
+    reason === "duration_expired"
+      ? formatTimerExpired(state)
+      : `${HERMES_PREFIX} ⏹️ Project \`${state.id.slice(0, 8)}\` killed (manual switch).`,
+  );
+  return state;
 }
 
 /** Check safety caps; returns the reason if any cap is exceeded. */

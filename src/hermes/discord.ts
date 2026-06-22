@@ -139,3 +139,28 @@ function formatDuration(ms: number): string {
   if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`;
   return `${Math.round(ms / 60_000)}m ${Math.round((ms % 60_000) / 1000)}s`;
 }
+
+/**
+ * Format the message posted when an auto-mode timer expires (ADR-0004).
+ * The state passed in is post-softExit — status is `killed` and
+ * `killedReason === "duration_expired"`. We don't have `state.timer`
+ * anymore (cleared by softExit), so we show the project's elapsed time
+ * and encourage /project resume without the old timer.
+ */
+export function formatTimerExpired(state: ProjectState): string {
+  const elapsed = state.endedAt
+    ? Math.round(
+        (new Date(state.endedAt).getTime() - new Date(state.startedAt).getTime()) /
+          60000,
+      )
+    : 0;
+  const done = state.plan.filter((t) => t.status === "done").length;
+  return [
+    `${HERMES_PREFIX} ⏱ **Auto-mode duration elapsed** — project stopped at next judge pass.`,
+    ``,
+    `Tasks completed: ${done}/${state.plan.length}. Elapsed: ${elapsed} min.`,
+    ``,
+    `Use \`/project resume\` to continue (without the old timer), or \`/project setMode auto <duration>\` to start a fresh window.`,
+    `Workspace: \`${state.repoPath}\``,
+  ].join("\n");
+}

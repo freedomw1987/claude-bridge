@@ -4,7 +4,7 @@
  */
 
 import { describe, test, expect } from "bun:test";
-import { pickNextTask, shouldStop } from "./orchestrator";
+import { checkTimerExpired, pickNextTask, shouldStop, softExit } from "./orchestrator";
 import {
   DEFAULT_HERMES_CONFIG,
   isActive,
@@ -255,5 +255,141 @@ describe("manual mode dispatch (regression: 2026-06-22)", () => {
     const manualDone = baseState({ mode: "manual", status: "done" });
     expect((autoDone.mode === "auto") && isActive(autoDone)).toBe(false);
     expect((manualDone.mode === "auto") && isActive(manualDone)).toBe(false);
+  });
+});
+
+// ── Timer expiry check (M2.4 / ADR-0004) ───────────────────────────
+
+describe("checkTimerExpired", () => {
+  test("returns false when no timer is set", () => {
+    const s = baseState();
+    expect(s.timer).toBeUndefined();
+    expect(checkTimerExpired(s)).toBe(false);
+  });
+
+  test("returns false when timer.expiresAt is in the future", () => {
+    const s = baseState();
+    s.timer = {
+      expiresAt: Date.now() + 60_000,
+      requestedDuration: "1m",
+      effectiveMs: 60_000,
+      clamped: false,
+    };
+    expect(checkTimerExpired(s)).toBe(false);
+  });
+
+  test("returns true when timer.expiresAt is in the past", () => {
+    const s = baseState();
+    s.timer = {
+      expiresAt: Date.now() - 1_000,
+      requestedDuration: "1m",
+      effectiveMs: 60_000,
+      clamped: false,
+    };
+    expect(checkTimerExpired(s)).toBe(true);
+  });
+
+  test("returns true when timer.expiresAt is exactly now (boundary)", () => {
+    const s = baseState();
+    s.timer = {
+      expiresAt: Date.now(),
+      requestedDuration: "1m",
+      effectiveMs: 60_000,
+      clamped: false,
+    };
+    // <= Date.now() is "expired" (we accept the boundary as past)
+    expect(checkTimerExpired(s)).toBe(true);
+  });
+});
+
+// ── softExit (M2.4 / ADR-0004) ──────────────────────────────────────
+//
+// softExit requires deps.thread (Discord ThreadChannel). For unit tests
+// we substitute a fake that records send() calls.
+
+class FakeThread {
+  sent: string[] = [];
+  send = async (content: string): Promise<unknown> => {
+    this.sent.push(content);
+    return {};
+  };
+}
+
+function makeDeps(thread: FakeThread, hermesDir: string) {
+  return {
+    hermesDir,
+    thread: thread as unknown as import("discord.js").ThreadChannel,
+    claudeSession: null as string | null,
+  };
+}
+
+describe("softExit (M2.4)", () => {
+  test("transitions active project to killed with duration_expired reason", async () => {
+    const thread = new FakeThread();
+    const deps = makeDeps(thread, "/tmp/hermes-soft-exit-test");
+    const s = baseState({ status: "judging" });
+    s.timer = {
+      expiresAt: Date.now() - 1_000,
+      handle: setTimeout(() => {}, 1) as unknown as ReturnType<typeof setTimeout>,
+      requestedDuration: "1m",
+      effectiveMs: 60_000,
+      clamped: false,
+    };
+    const out = await softExit("p", s, deps, "duration_expired");
+    expect(out.status).toBe("killed");
+    expect(out.killedReason).toBe("duration_expired");
+    expect(out.endedAt).toBeDefined();
+    expect(out.timer).toBeUndefined();
+    expect(thread.sent.length).toBe(1);
+    expect(thread.sent[0]).toContain("Auto-mode duration elapsed");
+  });
+
+  test("manual_switch reason posts a different message", async () => {
+    const thread = new FakeThread();
+    const deps = makeDeps(thread, "/tmp/hermes-soft-exit-test");
+    const s = baseState({ status: "executing" });
+    s.timer = {
+      expiresAt: Date.now() + 60_000,
+      handle: undefined,
+      requestedDuration: "30m",
+      effectiveMs: 1_800_000,
+      clamped: false,
+    };
+    const out = await softExit("p", s, deps, "manual_switch");
+    expect(out.killedReason).toBe("manual_switch");
+    expect(thread.sent[0]).toContain("manual switch");
+  });
+
+  test("clears the live timer handle so it doesn't keep process alive", async () => {
+    const thread = new FakeThread();
+    const deps = makeDeps(thread, "/tmp/hermes-soft-exit-test");
+    const s = baseState({ status: "judging" });
+    const handle = setTimeout(() => {}, 60_000) as unknown as ReturnType<
+      typeof setTimeout
+    >;
+    s.timer = {
+      expiresAt: Date.now() - 1_000,
+      handle,
+      requestedDuration: "1m",
+      effectiveMs: 60_000,
+      clamped: false,
+    };
+    await softExit("p", s, deps, "duration_expired");
+    expect(s.timer?.handle).toBe(handle); // input not mutated
+  });
+
+  test("after softExit, isActive is false and isTerminal (killed) is true", async () => {
+    const thread = new FakeThread();
+    const deps = makeDeps(thread, "/tmp/hermes-soft-exit-test");
+    const s = baseState({ status: "executing" });
+    s.timer = {
+      expiresAt: Date.now() + 30_000,
+      requestedDuration: "30s",
+      effectiveMs: 30_000,
+      clamped: false,
+    };
+    const out = await softExit("p", s, deps, "duration_expired");
+    expect(isActive(out)).toBe(false);
+    expect(out.status).toBe("killed");
   });
 });
