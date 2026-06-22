@@ -23,7 +23,7 @@ import type { Message, ThreadChannel } from "discord.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { tool } from "@anthropic-ai/claude-agent-sdk";
 import { log } from "../logger";
-import { truncate } from "../discord/handlers/format";
+import { truncate, stripThinkTags } from "../discord/handlers/format";
 
 const DISCORD_MAX = 1900;
 
@@ -74,7 +74,21 @@ export const discordSendTool = tool(
       .describe("Optional: message ID to reply to (highlights it for the user)"),
   },
   async (input, _extra) => {
-    const content = input.content;
+    // RG-002: strip thinking-block tags BEFORE the length check and
+    // before posting. CC's content frequently wraps reasoning in
+    // <ant_thinking>...</ant_thinking> (or <thinking>...</thinking>
+    // for older models); if we don't strip, the user sees raw XML
+    // instead of CC's final answer. Stripping can also reduce the
+    // effective length, so a 2102-char raw CC reply with 1500 chars
+    // of thinking might legitimately fit in 1900 once stripped.
+    const rawContent = input.content;
+    const content = stripThinkTags(rawContent);
+    if (content !== rawContent) {
+      log.info("discord_send stripped thinking blocks", {
+        rawLength: rawContent.length,
+        strippedLength: content.length,
+      });
+    }
     log.info("discord_send called", {
       contentLength: content.length,
       hasReplyTarget: !!input.reply_to_message_id,

@@ -37,6 +37,7 @@ import { config } from "../config";
 import { log } from "../logger";
 import { splitForDiscord, DISCORD_MAX } from "../discord/split";
 import { readSystemPrompt } from "./systemPrompt";
+import { stripThinkTags } from "../discord/handlers/format";
 import {
   allDiscordTools,
   setDiscordToolDeps,
@@ -288,11 +289,12 @@ export async function runViaSdk(
         if (!hasToolUse) {
           for (const block of msg.message.content) {
             if (block.type === "text" && block.text.trim()) {
-              // Strip <thinking>...</thinking> blocks — CC's internal
-              // reasoning should not appear in Discord.
-              const visible = block.text
-                .replace(/<thinking>[\s\S]*?<\/thinking>/g, "")
-                .trim();
+              // RG-002: strip <ant_thinking>...</ant_thinking> AND
+              // <thinking>...</thinking> blocks. CC's internal
+              // reasoning should not appear in Discord. The helper
+              // lives in format.ts and is shared with discordSendTool
+              // so the strip is consistent across both paths.
+              const visible = stripThinkTags(block.text);
               if (!visible) continue;
               const chunks = splitForDiscord(visible, DISCORD_MAX);
               for (const chunk of chunks) {

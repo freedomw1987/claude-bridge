@@ -16,6 +16,7 @@ import {
   discordReadHistoryTool,
   setDiscordToolDeps,
 } from "./discordTool";
+import { DISCORD_MAX } from "../discord/split";
 
 // ---- Minimal Discord.js mocks ----
 
@@ -158,6 +159,74 @@ describe("discord_send tool", () => {
     );
     expect(result.isError).toBeUndefined();
     expect(send).toHaveBeenCalledWith("fallback");
+  });
+
+  // ── RG-002: thinking-block stripping ─────────────────────────────
+
+  it("strips <ant_thinking>...</ant_thinking> before posting (RG-002)", async () => {
+    const thread = makeThread({});
+    let sentContent = "";
+    const send = mock(async (content: string) => {
+      sentContent = content;
+      return thread.send(content);
+    });
+    setDiscordToolDeps({ thread, send });
+
+    const raw = "<ant_thinking>\nLet me think about this carefully...\nThe user wants X.\n</ant_thinking>\n\nHere is the final answer: do X then Y.";
+    const result = await (discordSendTool as any).handler(
+      { content: raw },
+      {},
+    );
+    expect(result.isError).toBeUndefined();
+    expect(sentContent).not.toContain("<ant_thinking>");
+    expect(sentContent).not.toContain("</ant_thinking>");
+    expect(sentContent).not.toContain("Let me think about this carefully");
+    expect(sentContent).toContain("Here is the final answer");
+  });
+
+  it("strips <thinking>...</thinking> (older CC variant) (RG-002)", async () => {
+    const thread = makeThread({});
+    let sentContent = "";
+    const send = mock(async (content: string) => {
+      sentContent = content;
+      return thread.send(content);
+    });
+    setDiscordToolDeps({ thread, send });
+
+    const raw = "<thinking>reasoning here</thinking>\nActual answer text.";
+    const result = await (discordSendTool as any).handler(
+      { content: raw },
+      {},
+    );
+    expect(result.isError).toBeUndefined();
+    expect(sentContent).not.toContain("<thinking>");
+    expect(sentContent).not.toContain("</thinking>");
+    expect(sentContent).toBe("Actual answer text.");
+  });
+
+  it("stripping lets a long raw content fit within 1900 chars (RG-002)", async () => {
+    // Reproduces the 02:44:45 Discord incident: raw CC reply was 2102
+    // chars (mostly thinking), got rejected, CC retried with 783 chars.
+    // With stripping, the 2102-char raw → ~600 chars stripped, fits.
+    const thread = makeThread({});
+    let sentContent = "";
+    const send = mock(async (content: string) => {
+      sentContent = content;
+      return thread.send(content);
+    });
+    setDiscordToolDeps({ thread, send });
+
+    const thinking = "<ant_thinking>\n" + "x".repeat(1900) + "\n</ant_thinking>\n";
+    const finalAnswer = "Final: short answer.";
+    const raw = thinking + finalAnswer;
+    expect(raw.length).toBeGreaterThan(DISCORD_MAX);
+
+    const result = await (discordSendTool as any).handler(
+      { content: raw },
+      {},
+    );
+    expect(result.isError).toBeUndefined();
+    expect(sentContent).toBe(finalAnswer);
   });
 });
 
