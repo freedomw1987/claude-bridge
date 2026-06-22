@@ -1,0 +1,849 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="" xml:lang="">
+<head>
+  <meta charset="utf-8" />
+  <meta name="generator" content="pandoc" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes" />
+  <title>claude-bridge 系統總覽 — 架構與功能</title>
+  <style>
+    /* Default styles provided by pandoc.
+    ** See https://pandoc.org/MANUAL.html#variables-for-html for config info.
+    */
+    html {
+      color: #1a1a1a;
+      background-color: #fdfdfd;
+    }
+    body {
+      margin: 0 auto;
+      max-width: 36em;
+      padding-left: 50px;
+      padding-right: 50px;
+      padding-top: 50px;
+      padding-bottom: 50px;
+      hyphens: auto;
+      overflow-wrap: break-word;
+      text-rendering: optimizeLegibility;
+      font-kerning: normal;
+    }
+    @media (max-width: 600px) {
+      body {
+        font-size: 0.9em;
+        padding: 12px;
+      }
+      h1 {
+        font-size: 1.8em;
+      }
+    }
+    @media print {
+      html {
+        background-color: white;
+      }
+      body {
+        background-color: transparent;
+        color: black;
+        font-size: 12pt;
+      }
+      p, h2, h3 {
+        orphans: 3;
+        widows: 3;
+      }
+      h2, h3, h4 {
+        page-break-after: avoid;
+      }
+    }
+    p {
+      margin: 1em 0;
+    }
+    a {
+      color: #1a1a1a;
+    }
+    a:visited {
+      color: #1a1a1a;
+    }
+    img {
+      max-width: 100%;
+    }
+    svg {
+      height: auto;
+      max-width: 100%;
+    }
+    h1, h2, h3, h4, h5, h6 {
+      margin-top: 1.4em;
+    }
+    h5, h6 {
+      font-size: 1em;
+      font-style: italic;
+    }
+    h6 {
+      font-weight: normal;
+    }
+    ol, ul {
+      padding-left: 1.7em;
+      margin-top: 1em;
+    }
+    li > ol, li > ul {
+      margin-top: 0;
+    }
+    blockquote {
+      margin: 1em 0 1em 1.7em;
+      padding-left: 1em;
+      border-left: 2px solid #e6e6e6;
+      color: #606060;
+    }
+    code {
+      font-family: Menlo, Monaco, Consolas, 'Lucida Console', monospace;
+      font-size: 85%;
+      margin: 0;
+      hyphens: manual;
+    }
+    pre {
+      margin: 1em 0;
+      overflow: auto;
+    }
+    pre code {
+      padding: 0;
+      overflow: visible;
+      overflow-wrap: normal;
+    }
+    .sourceCode {
+     background-color: transparent;
+     overflow: visible;
+    }
+    hr {
+      border: none;
+      border-top: 1px solid #1a1a1a;
+      height: 1px;
+      margin: 1em 0;
+    }
+    table {
+      margin: 1em 0;
+      border-collapse: collapse;
+      width: 100%;
+      overflow-x: auto;
+      display: block;
+      font-variant-numeric: lining-nums tabular-nums;
+    }
+    table caption {
+      margin-bottom: 0.75em;
+    }
+    tbody {
+      margin-top: 0.5em;
+      border-top: 1px solid #1a1a1a;
+      border-bottom: 1px solid #1a1a1a;
+    }
+    th {
+      border-top: 1px solid #1a1a1a;
+      padding: 0.25em 0.5em 0.25em 0.5em;
+    }
+    td {
+      padding: 0.125em 0.5em 0.25em 0.5em;
+    }
+    header {
+      margin-bottom: 4em;
+      text-align: center;
+    }
+    #TOC li {
+      list-style: none;
+    }
+    #TOC ul {
+      padding-left: 1.3em;
+    }
+    #TOC > ul {
+      padding-left: 0;
+    }
+    #TOC a:not(:hover) {
+      text-decoration: none;
+    }
+    code{white-space: pre-wrap;}
+    span.smallcaps{font-variant: small-caps;}
+    div.columns{display: flex; gap: min(4vw, 1.5em);}
+    div.column{flex: auto; overflow-x: auto;}
+    div.hanging-indent{margin-left: 1.5em; text-indent: -1.5em;}
+    /* The extra [class] is a hack that increases specificity enough to
+       override a similar rule in reveal.js */
+    ul.task-list[class]{list-style: none;}
+    ul.task-list li input[type="checkbox"] {
+      font-size: inherit;
+      width: 0.8em;
+      margin: 0 0.8em 0.2em -1.6em;
+      vertical-align: middle;
+    }
+    .display.math{display: block; text-align: center; margin: 0.5rem auto;}
+  </style>
+<style>
+  body {
+    max-width: 1100px !important;
+    margin: 0 auto !important;
+    padding: 32px 48px 80px !important;
+    font-family: -apple-system, "PingFang TC", "Microsoft JhengHei", "Helvetica Neue", Arial, sans-serif !important;
+    line-height: 1.7;
+    color: #1a1a1a;
+    background: #ffffff;
+  }
+  /* Override any dark theme rules from github-like.css */
+  body, body.markdown-body { background: #ffffff !important; color: #1a1a1a !important; }
+  h1, h1.title { color: #1f6feb; border-bottom: 2px solid #1f6feb; padding-bottom: 12px; margin-top: 0; background: #ffffff !important; }
+  h2 { color: #0969da; border-bottom: 1px solid #d0d7de; padding-bottom: 8px; margin-top: 48px; background: #ffffff !important; }
+  h3 { color: #1f2328; margin-top: 32px; background: #ffffff !important; }
+  h4, h5, h6 { color: #1f2328; background: #ffffff !important; }
+  p, li, td, th, blockquote, code, pre { color: #1a1a1a; background: #ffffff; }
+  table { border-collapse: collapse; margin: 16px 0; width: 100%; }
+  th, td { border: 1px solid #d0d7de; padding: 8px 12px; text-align: left; color: #1a1a1a; }
+  th { background: #f6f8fa !important; font-weight: 600; }
+  tr:nth-child(even) td { background: #f9fafb !important; }
+  code { background: #f6f8fa !important; padding: 2px 6px; border-radius: 4px; font-size: 0.9em; color: #1a1a1a; }
+  pre { background: #f6f8fa !important; border: 1px solid #d0d7de; border-radius: 6px; padding: 16px; overflow-x: auto; line-height: 1.5; }
+  pre code { background: none !important; padding: 0; }
+  blockquote { border-left: 4px solid #1f6feb; background: #f0f7ff !important; padding: 12px 16px; margin: 16px 0; color: #1a1a1a !important; }
+  hr { border: none; border-top: 1px solid #d0d7de; margin: 32px 0; }
+  a { color: #0969da; text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  #TOC { background: #f6f8fa !important; border: 1px solid #d0d7de; border-radius: 8px; padding: 16px 24px; margin-bottom: 32px; color: #1a1a1a; }
+  #TOC ul { padding-left: 20px; }
+  #TOC a { color: #0969da; }
+</style>
+<style>/* GitHub-like Markdown stylesheet for Hermes developer profile doc previews.
+   Embedded inline by build.sh so file:// works without a web server.
+   Self-contained — no external fonts, no external assets.
+   IMPORTANT: @media (prefers-color-scheme: dark) MUST be at the END of this
+   file. CSS specificity ties resolve by source order, so the dark override
+   must come AFTER all light-mode rules to actually take effect. */
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  font-size: 16px;
+  -webkit-text-size-adjust: 100%;
+}
+
+body {
+  margin: 0;
+  padding: 0;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans",
+    Helvetica, Arial, sans-serif, "Apple Color Emoji", "Segoe UI Emoji";
+  font-size: 16px;
+  line-height: 1.6;
+  color: #1f2328;
+  background: #ffffff;
+}
+
+.markdown-body {
+  max-width: 980px;
+  margin: 0 auto;
+  padding: 32px;
+}
+
+.preview-banner {
+  max-width: 980px;
+  margin: 0 auto;
+  padding: 12px 32px;
+  font-size: 13px;
+  color: #57606a;
+  background: #f6f8fa;
+  border-bottom: 1px solid #d0d7de;
+}
+.preview-banner a { color: #0969da; text-decoration: none; }
+.preview-banner a:hover { text-decoration: underline; }
+
+.markdown-body h1,
+.markdown-body h2,
+.markdown-body h3,
+.markdown-body h4,
+.markdown-body h5,
+.markdown-body h6 {
+  margin-top: 24px;
+  margin-bottom: 16px;
+  font-weight: 600;
+  line-height: 1.25;
+}
+
+.markdown-body h1 { font-size: 2em; border-bottom: 1px solid #d0d7de; padding-bottom: 0.3em; }
+.markdown-body h2 { font-size: 1.5em; border-bottom: 1px solid #d0d7de; padding-bottom: 0.3em; }
+.markdown-body h3 { font-size: 1.25em; }
+.markdown-body h4 { font-size: 1em; }
+.markdown-body h5 { font-size: 0.875em; }
+.markdown-body h6 { font-size: 0.85em; color: #57606a; }
+
+.markdown-body p { margin-top: 0; margin-bottom: 16px; }
+
+.markdown-body blockquote {
+  margin: 0 0 16px;
+  padding: 0 1em;
+  color: #57606a;
+  border-left: 4px solid #d0d7de;
+}
+
+.markdown-body code {
+  padding: 0.2em 0.4em;
+  margin: 0;
+  font-size: 85%;
+  background: rgba(175, 184, 193, 0.2);
+  border-radius: 6px;
+  font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
+
+.markdown-body pre {
+  padding: 16px;
+  overflow: auto;
+  font-size: 85%;
+  line-height: 1.45;
+  background: #f6f8fa;
+  border-radius: 6px;
+  margin-bottom: 16px;
+}
+
+.markdown-body pre code {
+  display: inline;
+  max-width: auto;
+  padding: 0;
+  margin: 0;
+  overflow: visible;
+  line-height: inherit;
+  word-wrap: normal;
+  background-color: transparent;
+  border: 0;
+}
+
+.markdown-body table {
+  display: block;
+  width: max-content;
+  max-width: 100%;
+  overflow: auto;
+  border-spacing: 0;
+  border-collapse: collapse;
+  margin-bottom: 16px;
+}
+
+.markdown-body table tr {
+  background: #ffffff;
+  border-top: 1px solid #d8dee4;
+}
+
+.markdown-body table tr:nth-child(2n) { background: #f6f8fa; }
+
+.markdown-body table th,
+.markdown-body table td {
+  padding: 6px 13px;
+  border: 1px solid #d8dee4;
+}
+
+.markdown-body table th { font-weight: 600; }
+
+.markdown-body ul,
+.markdown-body ol {
+  padding-left: 2em;
+  margin-bottom: 16px;
+}
+
+.markdown-body li + li { margin-top: 4px; }
+
+.markdown-body hr {
+  height: 0.25em;
+  margin: 24px 0;
+  background: #d0d7de;
+  border: 0;
+}
+
+.markdown-body a { color: #0969da; text-decoration: none; }
+.markdown-body a:hover { text-decoration: underline; }
+
+.markdown-body img { max-width: 100%; }
+
+.markdown-body input[type="checkbox"] {
+  margin-right: 0.4em;
+}
+
+/* ===== DARK MODE — MUST BE LAST so cascade resolves correctly ===== */
+@media (prefers-color-scheme: dark) {
+  body { color: #e6edf3; background: #0d1117; }
+  .markdown-body h1, .markdown-body h2 { border-bottom-color: #21262d; }
+  .markdown-body h3, .markdown-body h4, .markdown-body h5, .markdown-body h6 { color: #e6edf3; }
+  .markdown-body table { color: #e6edf3; }
+  .markdown-body table tr { background: #0d1117; border-top-color: #21262d; color: #e6edf3; }
+  .markdown-body table tr:nth-child(2n) { background: #161b22; color: #e6edf3; }
+  .markdown-body table th,
+  .markdown-body table td { border-color: #30363d; color: #e6edf3; }
+  .markdown-body table th { color: #f0f6fc; }
+  .markdown-body code { background: rgba(110, 118, 129, 0.4); color: #e6edf3; }
+  .markdown-body pre { background: #161b22; color: #e6edf3; }
+  .markdown-body pre code { background: transparent; color: #e6edf3; }
+  .markdown-body blockquote { color: #8b949e; border-left-color: #3b434b; }
+  .markdown-body blockquote p { color: #8b949e; }
+  .markdown-body hr { background: #21262d; }
+  .markdown-body a { color: #58a6ff; }
+  .preview-banner { background: #161b22; border-bottom-color: #21262d; color: #8b949e; }
+  .preview-banner a { color: #58a6ff; }
+}
+</style>
+</head>
+<body class="markdown-body" style="background:#ffffff;color:#1a1a1a">
+<header id="title-block-header">
+</header>
+<nav id="TOC" role="doc-toc">
+<ul>
+<li><a href="#系統總覽架構-功能"
+id="toc-系統總覽架構-功能">系統總覽(架構 + 功能)</a>
+<ul>
+<li><a href="#佢做咩" id="toc-佢做咩">🎯 佢做咩?</a></li>
+<li><a href="#架構三層" id="toc-架構三層">🏗️ 架構(三層)</a></li>
+<li><a href="#兩種工作模式" id="toc-兩種工作模式">🧩
+兩種工作模式</a></li>
+<li><a href="#系統文件佈局" id="toc-系統文件佈局">📁
+系統文件佈局</a></li>
+<li><a href="#核心-sub-system-簡介" id="toc-核心-sub-system-簡介">⚙️
+核心 sub-system 簡介</a></li>
+<li><a href="#safety-limits" id="toc-safety-limits">🛡️ Safety +
+Limits</a></li>
+<li><a href="#discord-commands-速查" id="toc-discord-commands-速查">🚦
+Discord Commands 速查</a></li>
+<li><a href="#claude-code-嘅-discord-工具sdk-模式"
+id="toc-claude-code-嘅-discord-工具sdk-模式">🔌 Claude Code 嘅 Discord
+工具(SDK 模式)</a></li>
+<li><a href="#testing-docs" id="toc-testing-docs">🧪 Testing +
+Docs</a></li>
+<li><a href="#適合咩場景用" id="toc-適合咩場景用">💡
+適合咩場景用?</a></li>
+<li><a href="#常見問題" id="toc-常見問題">❓ 常見問題</a></li>
+<li><a href="#延伸閱讀" id="toc-延伸閱讀">📚 延伸閱讀</a></li>
+</ul></li>
+</ul>
+</nav>
+<h1 id="系統總覽架構-功能">系統總覽(架構 + 功能)</h1>
+<p><strong>一句講晒</strong>: claude-bridge 係一個 <strong>Discord
+bot</strong>, 將你嘅 Discord 對話室直接駁去 <strong>Claude
+Code</strong>(本機行嘅 AI 編程助手), 等你可以喺 Discord 上面直接叫
+Claude 幫你寫 code、整 bug、改架構, 唔使再開 terminal。</p>
+<hr />
+<h2 id="佢做咩">🎯 佢做咩?</h2>
+<p>想像你而家嘅 workflow:</p>
+<pre><code>1. 開 Terminal
+2. cd ~/www/myproject
+3. claude (開 Claude Code)
+4. 寫 prompt
+5. 等 Claude 改 code
+6. 睇 diff
+7. 反覆 loop</code></pre>
+<p>用咗 claude-bridge 之後:</p>
+<pre><code>1. 喺 Discord 寫 @bot 我想加個 login page
+2. Claude 自動喺 myproject 開 thread
+3. 佢直接改你嘅 file
+4. 改完貼 diff 喺 Discord
+5. 你睇完直接話 &quot;go&quot; / 收工</code></pre>
+<p><strong>核心價值</strong>: - 唔使離開 Discord 就可以 pair-program -
+每個 prompt / 任務 = 一個獨立 thread(可以 archive) - 自動 git clone +
+setup work dir,你唔使再 <code>cd</code> / <code>git pull</code> - 可以
+arm 一個 <strong>Hermes agent</strong> 幫你自動跑 project(planning →
+executing → judging 迴圈)</p>
+<hr />
+<h2 id="架構三層">🏗️ 架構(三層)</h2>
+<pre><code>┌─────────────────────────────────────────────────────┐
+│  Discord                                            │
+│  #dev channel  ──@bot &lt;prompt&gt;──►  new thread       │
+│                                ──/project start──►  │
+└─────────────────────────┬───────────────────────────┘
+                          │ Discord WebSocket
+┌─────────────────────────▼───────────────────────────┐
+│  claude-bridge bot  (Node.js + bun)                 │
+│  ┌─────────────────┐  ┌────────────────────────┐    │
+│  │ @bot flow       │  │ /project  flow         │    │
+│  │  - 1-shot       │  │  - Hermes orchestrator │    │
+│  │  - 直接 forward │  │  - planner / judge     │    │
+│  │  - session 保存 │  │  - executor / state    │    │
+│  └────────┬────────┘  └──────────┬─────────────┘    │
+│           └──────────┬───────────┘                  │
+│                      ▼                              │
+│            ┌─────────────────────┐                  │
+│            │  runViaSdk()        │                  │
+│            │  (Claude Code SDK)  │                  │
+│            └──────────┬──────────┘                  │
+└───────────────────────┼─────────────────────────────┘
+                        │ JSON-RPC over stdin/stdout
+┌───────────────────────▼────────────────────────────┐
+│  Claude Code  (host subprocess)                    │
+│  cwd = ~/www/myproject                             │
+│  直接讀寫 host file system                         │
+└────────────────────────────────────────────────────┘</code></pre>
+<p><strong>一句解</strong>: Discord 收 message → bot 解析 → 揀 runner →
+spawn Claude Code 落本機行 → 結果 stream 返 Discord。</p>
+<hr />
+<h2 id="兩種工作模式">🧩 兩種工作模式</h2>
+<h3 id="bot-prompt-1-shot-模式-簡單即用">1️⃣
+<code>@bot &lt;prompt&gt;</code> — 1-shot 模式 (簡單即用)</h3>
+<pre><code>你:  @bot 我想加個 login page
+bot:  (開新 thread &quot;📋 login page&quot;)
+bot:  (clone 你個 repo / 跳入 local dir)
+bot:  (forward 個 prompt 畀 Claude Code)
+CC:   我幫你整咗 src/components/Login.tsx, ...
+bot:  (stream 返個 diff / 結果)</code></pre>
+<p><strong>特性</strong>: - 1 thread = 1 個 prompt - 跟住落嚟你可以繼續
+reply 對話(會 resume 同一個 Claude session) - 唔使預先 commit goal,純
+free chat</p>
+<h3 id="project-start-goal-hermes-自動模式-多任務規劃">2️⃣
+<code>/project start "&lt;goal&gt;"</code> — Hermes 自動模式
+(多任務規劃)</h3>
+<pre><code>你:  /project start &quot;build a todo CLI app with auth&quot;
+bot:  (開 thread &quot;📋 build a todo CLI app with auth&quot;)
+bot:  🎯 Hermes project started
+bot:  📋 Planning...
+[Hermes planner LLM]
+bot:  Plan ready: 5 tasks
+      1. Init project structure
+      2. Build CLI entry point
+      3. Add auth module
+      4. Add todo CRUD
+      5. Write tests
+bot:  🛠 Task #1: Init project structure
+      (CC runs task 1)
+      (judge LLM check: needs_more → task 6)
+bot:  🛠 Task #2: Build CLI entry point
+      ...
+bot:  ✅ All done</code></pre>
+<p><strong>特性</strong>: - 1 thread = 1 個 project(state machine:
+planning → executing ⇄ judging → done/failed/killed) - LLM 自己拆
+task、執行 task、自我審查(judge verdict) - 有 safety cap: max iterations
+/ cost / wall-hours - Bot 重啟後自動 resume 啲 active project - 可以
+<code>/project setMode auto 1h</code> 限時 auto-run, 1h 後軟退出</p>
+<hr />
+<h2 id="系統文件佈局">📁 系統文件佈局</h2>
+<pre><code>claude-bridge/
+├─ src/
+│  ├─ index.ts                    # 入口
+│  ├─ config.ts                   # env vars
+│  ├─ discord/                    # Discord handlers
+│  │   ├─ client.ts
+│  │   ├─ parser.ts               # parse @bot mention
+│  │   └─ handlers/
+│  │       ├─ messageCreate.ts    # 路由
+│  │       ├─ streaming.ts        # CC runner orchestration
+│  │       ├─ commands.ts         # /kill /status /projects
+│  │       └─ hermesCommands.ts   # /project start|setMode|adopt|...
+│  ├─ agent/                      # Claude Code integration
+│  │   ├─ sdkRunner.ts            # SDK query() wrapper
+│  │   ├─ runner.ts               # CLI fallback
+│  │   └─ discordTool.ts          # CC 用的 Discord MCP tools
+│  ├─ hermes/                     # 自動模式 brain
+│  │   ├─ orchestrator.ts         # 主 state machine
+│  │   ├─ planner.ts              # LLM 任務拆解
+│  │   ├─ judge.ts                # LLM 自審
+│  │   ├─ executor.ts             # 任務執行
+│  │   ├─ state.ts                # state.json 持久化
+│  │   ├─ types.ts
+│  │   └─ duration.ts             # &quot;30m&quot; / &quot;1h30m&quot; parser
+│  └─ db/                         # SQLite session store
+├─ data/
+│  ├─ sessions.db                 # Discord thread ↔ CC session 對照
+│  ├─ bot.log
+│  └─ hermes/
+│     └─ projects/
+│        └─ &lt;uuid&gt;/               # 每個 Hermes project 一個 dir
+│           ├─ state.json         # 當前狀態
+│           ├─ journal.log        # 決策 log
+│           └─ plan.md
+└─ ~/www/
+   └─ &lt;project&gt;/                  # Claude Code 嘅實際 work dir</code></pre>
+<hr />
+<h2 id="核心-sub-system-簡介">⚙️ 核心 sub-system 簡介</h2>
+<table>
+<colgroup>
+<col style="width: 33%" />
+<col style="width: 33%" />
+<col style="width: 33%" />
+</colgroup>
+<thead>
+<tr>
+<th>Sub-system</th>
+<th>負責</th>
+<th>點用</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><strong>messageCreate</strong></td>
+<td>收 Discord message + 路由</td>
+<td>自動, 你唔使理</td>
+</tr>
+<tr>
+<td><strong><span class="citation" data-cites="bot">@bot</span>
+parser</strong></td>
+<td>解析 <code>@bot &lt;prompt&gt;</code> 個 prompt</td>
+<td>自動, prompt 第一句做 thread 名</td>
+</tr>
+<tr>
+<td><strong>runner (SDK / CLI)</strong></td>
+<td>落本機行 Claude Code</td>
+<td>SDK 係 default, CLI 係 fallback</td>
+</tr>
+<tr>
+<td><strong>Hermes orchestrator</strong></td>
+<td>自動模式 state machine</td>
+<td><code>/project start</code> 嗰陣 kick off</td>
+</tr>
+<tr>
+<td><strong>planner + judge</strong></td>
+<td>LLM 拆 task + 自審</td>
+<td>內部 LLM (<code>claude-haiku-4-5</code>)</td>
+</tr>
+<tr>
+<td><strong>state (disk)</strong></td>
+<td>project 狀態持久化</td>
+<td><code>data/hermes/projects/&lt;uuid&gt;/state.json</code></td>
+</tr>
+<tr>
+<td><strong>typing indicator</strong></td>
+<td>Discord typing 燈</td>
+<td>自動, 8s refresh</td>
+</tr>
+<tr>
+<td><strong>memory monitor</strong></td>
+<td>自我 watchdog (RSS)</td>
+<td>自動, 超 800MB exit</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="safety-limits">🛡️ Safety + Limits</h2>
+<table>
+<thead>
+<tr>
+<th>Cap</th>
+<th>默認值</th>
+<th>Env var</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Max project iterations</td>
+<td>20</td>
+<td><code>HERMES_MAX_ITERATIONS</code></td>
+</tr>
+<tr>
+<td>Max cost per project</td>
+<td>$5 USD</td>
+<td><code>HERMES_MAX_COST_USD</code></td>
+</tr>
+<tr>
+<td>Max wall hours per project</td>
+<td>4h</td>
+<td><code>HERMES_MAX_WALL_HOURS</code></td>
+</tr>
+<tr>
+<td>Max attempts per task</td>
+<td>3</td>
+<td><code>HERMES_MAX_ATTEMPTS_PER_TASK</code></td>
+</tr>
+<tr>
+<td>Bot RSS threshold</td>
+<td>800 MB</td>
+<td><code>BOT_RSS_THRESHOLD_MB</code></td>
+</tr>
+<tr>
+<td>Discord API rate limit</td>
+<td>per Discord</td>
+<td>n/a</td>
+</tr>
+</tbody>
+</table>
+<p><strong>Soft-exit model</strong>: Timer 唔係 kill 個 task,而係喺
+judge boundary 軟退出(保留所有 in-flight work)。 David 可以
+<code>/project resume</code> 接手。</p>
+<hr />
+<h2 id="discord-commands-速查">🚦 Discord Commands 速查</h2>
+<table>
+<colgroup>
+<col style="width: 50%" />
+<col style="width: 50%" />
+</colgroup>
+<thead>
+<tr>
+<th>Command</th>
+<th>做咩</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>@bot &lt;prompt&gt;</code></td>
+<td>1-shot CC run(開新 thread)</td>
+</tr>
+<tr>
+<td><code>/project start "goal"</code></td>
+<td>開 Hermes-managed project</td>
+</tr>
+<tr>
+<td><code>/project start in ~/work "goal"</code></td>
+<td>指定 local dir</td>
+</tr>
+<tr>
+<td><code>/project start "goal" auto 1h</code></td>
+<td>開 project 同時限時 1h auto-run</td>
+</tr>
+<tr>
+<td><code>/project adopt "goal" [auto/manual]</code></td>
+<td>將 plain thread 升級做 Hermes project</td>
+</tr>
+<tr>
+<td><code>/project status</code></td>
+<td>查當前 project 狀態</td>
+</tr>
+<tr>
+<td><code>/project plan</code></td>
+<td>睇個 plan</td>
+</tr>
+<tr>
+<td><code>/project setMode auto 30m</code></td>
+<td>中途 arm auto timer</td>
+</tr>
+<tr>
+<td><code>/project setMode manual</code></td>
+<td>停 auto timer, 改 manual</td>
+</tr>
+<tr>
+<td><code>/project kill</code></td>
+<td>立即停 project</td>
+</tr>
+<tr>
+<td><code>/project resume</code></td>
+<td>重啟 killed / failed project</td>
+</tr>
+<tr>
+<td><code>/project list</code></td>
+<td>列出所有 project</td>
+</tr>
+<tr>
+<td><code>/kill</code></td>
+<td>殺 CC subprocess(thread 保留)</td>
+</tr>
+<tr>
+<td><code>/status</code></td>
+<td>查 session 狀態</td>
+</tr>
+<tr>
+<td><code>/projects</code></td>
+<td>列出 known projects</td>
+</tr>
+<tr>
+<td><code>/help</code></td>
+<td>完整指令 list</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="claude-code-嘅-discord-工具sdk-模式">🔌 Claude Code 嘅 Discord
+工具(SDK 模式)</h2>
+<p>Claude Code 喺 run 期間可以主動用 4 個 Discord MCP tools:</p>
+<table>
+<thead>
+<tr>
+<th>Tool</th>
+<th>做咩</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>discord_send</code></td>
+<td>喺 thread 發新 message</td>
+</tr>
+<tr>
+<td><code>discord_typing</code></td>
+<td>維持 typing 燈</td>
+</tr>
+<tr>
+<td><code>discord_react</code></td>
+<td>對 message 加 emoji reaction</td>
+</tr>
+<tr>
+<td><code>discord_read_history</code></td>
+<td>讀 thread 過往 message</td>
+</tr>
+</tbody>
+</table>
+<p><strong>用途</strong>: 當 CC 做完嘢想主動通知(唔等 David reply),可以
+<code>discord_send</code> 出嚟。</p>
+<hr />
+<h2 id="testing-docs">🧪 Testing + Docs</h2>
+<ul>
+<li><strong>344 個 unit / integration tests</strong>(bun:test, ~5s
+全跑)</li>
+<li><strong>20 個 invariant</strong> 喺
+<code>docs/REGRESSION-GUARD.md</code> (防 bug 翻發)</li>
+<li><strong>8 份核心 doc</strong>: PRD, ARCHITECTURE, MILESTONES,
+REGRESSION-GUARD, AUDIT, taskboard, retros/, operations/</li>
+<li><strong>3 條 launchd watchdog</strong>: bot crash 自動 respawn
+(KeepAlive)</li>
+<li><strong>無 secrets commit</strong>: <code>.env</code> gitignore +
+Hermes redact 機制</li>
+</ul>
+<hr />
+<h2 id="適合咩場景用">💡 適合咩場景用?</h2>
+<table>
+<thead>
+<tr>
+<th>場景</th>
+<th>啱唔啱</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>多人協作開發(有 Discord 頻道)</td>
+<td>✅ 完美</td>
+</tr>
+<tr>
+<td>個人 side project</td>
+<td>✅ 方便</td>
+</tr>
+<tr>
+<td>需要 audit trail(公司 review)</td>
+<td>✅ state.json + journal.log 全部有</td>
+</tr>
+<tr>
+<td>Quick 1-shot 改 file</td>
+<td>✅ <span class="citation" data-cites="bot">@bot</span> 最快</td>
+</tr>
+<tr>
+<td>多步任務自動跑過夜</td>
+<td>✅ /project start auto 4h</td>
+</tr>
+<tr>
+<td>純粹 command line 開發</td>
+<td>⚠️ 仲用返 Claude Code CLI 直接</td>
+</tr>
+<tr>
+<td>沙盒環境(Docker / 隔離)</td>
+<td>❌ CC 寫 host file 唔隔離</td>
+</tr>
+</tbody>
+</table>
+<hr />
+<h2 id="常見問題">❓ 常見問題</h2>
+<p><strong>Q: 點解唔直接用 Claude Code 個 CLI?</strong> A: CLI 要你離開
+Discord 開 terminal。 claude-bridge 將對話收埋喺 Discord thread,
+<strong>history 自然 preserve</strong>, 多人睇得到, reply 用 emoji/go
+掣做得到。</p>
+<p><strong>Q: Hermes mode 同 <span class="citation"
+data-cites="bot">@bot</span> mode 點揀?</strong> A: 簡單 prompt / debug
+用 <code>@bot</code>, 多步規劃任務(整 feature、refactor)用
+<code>/project start</code>。</p>
+<p><strong>Q: Bot crash 點算?</strong> A: launchd 自動 respawn
+(KeepAlive),in-flight project 會喺 boot 時
+<code>resumeActiveProjects()</code> 自動接手。</p>
+<p><strong>Q: Claude Code 寫錯 file 點算?</strong> A: 佢有 git
+access(透過 work dir)。 David 可以直接 <code>git diff</code> 喺 host,
+唔啱就 <code>git checkout</code> 復原。<strong>建議開始 Hermes project
+之前 commit 一次 baseline</strong>。</p>
+<p><strong>Q: 點睇返舊時 Hermes 嘅決策?</strong> A:
+<code>cat data/hermes/projects/&lt;uuid&gt;/journal.log</code> +
+<code>cat data/hermes/projects/&lt;uuid&gt;/state.json</code>。<strong>全部
+disk 上</strong>,冇 DB vendor lock-in。</p>
+<hr />
+<h2 id="延伸閱讀">📚 延伸閱讀</h2>
+<ul>
+<li>詳細架構: <code>docs/ARCHITECTURE.md</code></li>
+<li>用戶 PRD: <code>docs/PRD.md</code></li>
+<li>開發 milestones: <code>docs/MILESTONES.md</code></li>
+<li>防 bug 翻發: <code>docs/REGRESSION-GUARD.md</code></li>
+<li>各 retro: <code>docs/retros/*.md</code></li>
+<li>設計決策: <code>docs/operations/*.md</code></li>
+</ul>
+</body>
+</html>
