@@ -81,6 +81,22 @@ Discord Channel
   minus elapsed wallclock).
 - See [ADR-0004](operations/0004-setmode-auto-duration.md).
 
+### F8 — Thread-upgrade workflow: `/project adopt` (Phase 1.5+)
+- `/project adopt "<goal>" [auto <duration>] [manual]` — promote an
+  existing plain Claude Code session thread (started via `@bot <prompt>`)
+  into a Hermes-managed project. Solves the workflow gap where David
+  wants to first discuss requirements with Claude Code, then hand off
+  to Hermes once the goal is clear, without having to re-spin a fresh
+  thread and re-paste context.
+- Default mode = `auto`, duration default = `HERMES_MAX_WALL_HOURS` (4h).
+- Pre-flight: thread must have a Claude Code session in `sessions.db`;
+  thread must NOT already have a Hermes project (soft-reject with goal
+  preview — use `/project kill` first, or `/project setMode` to change).
+- `state.adoption` field records provenance (`fromSession`, `adoptedAt`,
+  `originalRepoPath`, `originalSessionId`) for audit. The orchestrator
+  does not branch on this field — informational only.
+- See [RG-004](REGRESSION-GUARD.md#rg-004-project-adopt-thread-upgrade-workflow-2026-06-22).
+
 ## Non-functional Requirements
 
 - **Latency**: First claude response within 10s of mention

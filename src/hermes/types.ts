@@ -62,7 +62,8 @@ export type JournalEntryType =
   | "status"
   | "escalate"
   | "resume"
-  | "timer";
+  | "timer"
+  | "adopt";
 
 export interface Task {
   id: string;
@@ -134,6 +135,42 @@ export interface ProjectState {
    * Surfaced in `/project status` and the journal entry on transition.
    */
   killedReason?: KilledReason;
+  /**
+   * Audit trail for `/project adopt` upgrades. Set when an existing
+   * plain Claude Code session thread is promoted into a Hermes-managed
+   * project. Absent for projects created via `/project start`.
+   *
+   * We keep this as an optional field rather than a top-level flag so
+   * `/project status` and the journal can show "adopted from CC
+   * session" history. The orchestrator does not branch on this field
+   * — its presence is purely informational.
+   */
+  adoption?: ProjectAdoption;
+}
+
+/**
+ * Records the provenance of a Hermes project that was upgraded from an
+ * existing plain Claude Code session thread via `/project adopt`.
+ *
+ * Invariants (see docs/REGRESSION-GUARD.md RG-004):
+ *  - `fromSession` is always true on a populated record (distinguishes
+ *    adopt from `/project start`).
+ *  - `adoptedAt` is the ISO-8601 timestamp of the `/project adopt`
+ *    invocation that created this project.
+ *  - `originalRepoPath` is the working directory the Claude Code
+ *    session was using, taken from the SQLite `sessions.repoPath` at
+ *    adopt time. We do not promise it's still valid — the user can
+ *    move dirs between sessions.
+ *  - `originalSessionId` is the Claude Code session UUID that was
+ *    active in the thread at adopt time. The orchestrator's executor
+ *    resumes this session on the first task so the new Hermes
+   *    sub-tasks inherit the conversation context.
+ */
+export interface ProjectAdoption {
+  fromSession: true;
+  adoptedAt: string;
+  originalRepoPath: string;
+  originalSessionId: string;
 }
 
 export type JudgeVerdictType = "done" | "needs_more" | "stuck";

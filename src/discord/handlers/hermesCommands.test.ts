@@ -6,6 +6,7 @@
 import { describe, test, expect } from "bun:test";
 import {
   isProjectCommand,
+  matchAdopt,
   matchList,
   matchStart,
   matchStatus,
@@ -268,5 +269,118 @@ describe("matchSetMode with duration (M2.6)", () => {
       mode: "auto",
       duration: "1h",
     });
+  });
+});
+
+
+// ── RG-004: matchAdopt (thread-upgrade workflow) ─────────
+
+describe("matchAdopt", () => {
+  test("matches /project adopt \"<goal>\" with no mode (defaults to auto)", () => {
+    expect(matchAdopt('/project adopt "fix the auth bug"')).toEqual({
+      goal: "fix the auth bug",
+      mode: "auto",
+    });
+  });
+
+  test("matches /project adopt \"<goal>\" auto 1h (auto with duration)", () => {
+    expect(matchAdopt('/project adopt "fix the auth bug" auto 1h')).toEqual({
+      goal: "fix the auth bug",
+      mode: "auto",
+      duration: "1h",
+    });
+  });
+
+  test("matches /project adopt \"<goal>\" auto 30m (auto with minutes)", () => {
+    expect(matchAdopt('/project adopt "ship the dashboard" auto 30m')).toEqual({
+      goal: "ship the dashboard",
+      mode: "auto",
+      duration: "30m",
+    });
+  });
+
+  test("matches /project adopt \"<goal>\" auto 1h30m (multi-unit duration)", () => {
+    expect(matchAdopt('/project adopt "ship the dashboard" auto 1h30m')).toEqual({
+      goal: "ship the dashboard",
+      mode: "auto",
+      duration: "1h30m",
+    });
+  });
+
+  test("matches /project adopt \"<goal>\" manual", () => {
+    expect(matchAdopt('/project adopt "fix typo in README" manual')).toEqual({
+      goal: "fix typo in README",
+      mode: "manual",
+    });
+  });
+
+  test("case-insensitive on mode", () => {
+    expect(matchAdopt('/project adopt "abcd" AUTO 1h')).toEqual({
+      goal: "abcd",
+      mode: "auto",
+      duration: "1h",
+    });
+    expect(matchAdopt('/project adopt "abcd" Manual')).toEqual({
+      goal: "abcd",
+      mode: "manual",
+    });
+  });
+
+  test("trims whitespace inside the goal", () => {
+    expect(matchAdopt('/project adopt "  spaces around  "')).toEqual({
+      goal: "spaces around",
+      mode: "auto",
+    });
+  });
+
+  test("handles @bot mention prefix", () => {
+    expect(matchAdopt('<@12345> /project adopt "abcd" auto 5m')).toEqual({
+      goal: "abcd",
+      mode: "auto",
+      duration: "5m",
+    });
+  });
+
+  test("rejects unquoted goal (must use double quotes)", () => {
+    expect(matchAdopt("/project adopt fix the bug")).toBeNull();
+    expect(matchAdopt("/project adopt 'fix the bug'")).toBeNull(); // single quotes not allowed
+  });
+
+  test("rejects missing goal", () => {
+    expect(matchAdopt("/project adopt")).toBeNull();
+    expect(matchAdopt("/project adopt \"\"")).toBeNull(); // empty
+  });
+
+  test("rejects goal shorter than 3 chars", () => {
+    expect(matchAdopt('/project adopt "x"')).toBeNull();
+    expect(matchAdopt('/project adopt "ab"')).toBeNull();
+  });
+
+  test("rejects conflicting mode tokens (auto + manual)", () => {
+    expect(matchAdopt('/project adopt "abcd" auto 1h manual')).toBeNull();
+    expect(matchAdopt('/project adopt "abcd" manual auto')).toBeNull();
+  });
+
+  test("rejects manual + duration (manual is wallclock-free)", () => {
+    // Our matcher explicitly doesn't allow "manual 1h" because manual
+    // mode has no timer concept. The trailing regex demands either
+    // bare "manual" or "auto [duration]".
+    expect(matchAdopt('/project adopt "abcd" manual 1h')).toBeNull();
+  });
+
+  test("rejects trailing garbage", () => {
+    expect(matchAdopt('/project adopt "abcd" auto 30m extra')).toBeNull();
+    expect(matchAdopt('/project adopt "abcd" manual extra')).toBeNull();
+  });
+
+  test("rejects non-adopt /project commands", () => {
+    expect(matchAdopt("/project start \"abcd\"")).toBeNull();
+    expect(matchAdopt("/project status")).toBeNull();
+    expect(matchAdopt("/project kill")).toBeNull();
+  });
+
+  test("rejects non-/project content", () => {
+    expect(matchAdopt("adopt \"abcd\"")).toBeNull();
+    expect(matchAdopt("hello world")).toBeNull();
   });
 });

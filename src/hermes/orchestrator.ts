@@ -36,8 +36,8 @@ import {
   loadState,
   saveState,
 } from "./state";
-import type { ProjectState, Task } from "./types";
-import { isActive } from "./types";
+import type { ProjectAdoption, ProjectMode, ProjectState, Task } from "./types";
+import { isActive, newProjectState, type HermesRuntimeConfig } from "./types";
 import {
   formatCompletion,
   formatEscalation,
@@ -709,4 +709,66 @@ function formatDuration(ms: number): string {
   if (ms < 1000) return `${ms}ms`;
   if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`;
   return `${Math.round(ms / 60_000)}m ${Math.round((ms % 60_000) / 1000)}s`;
+}
+
+/**
+ * Adopt an existing plain Claude Code session thread into a Hermes-managed
+ * project (RG-004).
+ *
+ * Workflow rationale: David's preferred flow is to first chat with
+ * Claude Code via `@bot <prompt>` in a thread to discuss requirements,
+ * then upgrade the thread to a Hermes-managed project once the goal
+ * is clear. This function performs that upgrade:
+ *
+ *   1. Builds a `ProjectState` with the `adoption` field populated for
+ *      audit trail.
+ *   2. Persists state and journal.
+ *
+ * The caller (`handleProjectAdopt` in hermesCommands.ts) is responsible
+ * for:
+ *  - Validating no existing Hermes project on this thread (soft-reject
+ *    with a "kill first" hint per 3B).
+ *  - Looking up the existing Claude Code session in the SQLite
+ *    `sessions` table (must exist; we don't synthesize one).
+ *  - Parsing the duration string and clamping to `maxWallHours`.
+ *  - Arming the wallclock timer if mode === "auto".
+ *  - Kicking off the orchestrator after this returns.
+ *
+ * @returns the new ProjectState (also persisted to disk)
+ */
+export function adoptProject(input: {
+  hermesDir: string;
+  projectId: string;
+  threadId: string;
+  goal: string;
+  mode: ProjectMode;
+  repoPath: string;
+  repoSource: "new" | "clone" | "local";
+  config: HermesRuntimeConfig;
+  adoption: ProjectAdoption;
+}): ProjectState {
+  ensureProjectDir(input.hermesDir, input.projectId);
+  const state = newProjectState({
+    id: input.projectId,
+    threadId: input.threadId,
+    goal: input.goal,
+    mode: input.mode,
+    repoPath: input.repoPath,
+    repoSource: input.repoSource,
+    config: input.config,
+  });
+  state.adoption = input.adoption;
+  saveState(input.hermesDir, input.projectId, state);
+  appendJournal(input.hermesDir, input.projectId, {
+    type: "adopt",
+    message: `thread adopted from CC session; originalRepoPath=${input.adoption.originalRepoPath}, originalSessionId=${input.adoption.originalSessionId.slice(0, 12)}…`,
+  });
+  log.info("hermes: project adopted from CC session", {
+    projectId: input.projectId,
+    threadId: input.threadId,
+    repoPath: input.repoPath,
+    repoSource: input.repoSource,
+    mode: input.mode,
+  });
+  return state;
 }

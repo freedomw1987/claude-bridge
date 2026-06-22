@@ -40,7 +40,7 @@ import {
   type HermesRuntimeConfig,
   type ProjectMode,
 } from "../../hermes/types";
-import { armProjectTimer, runProject, softExit } from "../../hermes/orchestrator";
+import { armProjectTimer, adoptProject, runProject, softExit } from "../../hermes/orchestrator";
 import {
   formatPlanMessage,
   formatStatusEmbed,
@@ -125,6 +125,53 @@ export const matchSetMode = (
   if (leftover && leftover.length > 0) return null;
   if (duration) return { mode: modeRaw, duration };
   return { mode: modeRaw };
+};
+
+/**
+ * Match `/project adopt "<goal>" [auto <duration>] [manual]`.
+ *
+ * The goal MUST be wrapped in double quotes (same convention as
+ * `/project start`). After the closing quote, optional mode and
+ * duration tokens can appear in either order:
+ *
+ *   "/project adopt \"fix the auth bug\""           → auto 4h (default)
+ *   "/project adopt \"fix the auth bug\" auto 1h"   → auto 1h
+ *   "/project adopt \"fix the auth bug\" manual"    → manual
+ *   "/project adopt \"x\" auto 30m manual"          → null (conflicting modes)
+ *
+ * Returns the parsed args, or null if the command shape is invalid.
+ * Validation of session existence, no-existing-Hermes-project, duration
+ * parsing, etc. is done in handleProjectAdopt.
+ */
+export const matchAdopt = (
+  content: string,
+):
+  | { goal: string; mode: "auto" | "manual"; duration?: string }
+  | null => {
+  // Group 1: quoted goal, Group 2: trailing tokens (optional).
+  const m = stripMention(content).match(
+    /^\/project\s+adopt\s+"([^"]+)"(?:\s+([\s\S]+))?$/i,
+  );
+  if (!m) return null;
+  const goal = m[1].trim();
+  if (goal.length < 3) return null;
+  const trailing = (m[2] ?? "").trim();
+  if (trailing === "") {
+    return { goal, mode: "auto" };
+  }
+  // Trailing must be either:
+  //   "manual"
+  //   "auto [duration]"
+  // Anything else → null. We don't accept "manual [duration]" because
+  // manual mode is wallclock-free by definition.
+  if (/^manual$/i.test(trailing)) {
+    return { goal, mode: "manual" };
+  }
+  const autoMatch = trailing.match(/^auto(?:\s+([\dhms]+))?$/i);
+  if (autoMatch) {
+    return { goal, mode: "auto", duration: autoMatch[1] };
+  }
+  return null;
 };
 
 // ── Top-level handlers ────────────────────────────────────────────────
@@ -248,6 +295,172 @@ export async function handleProjectStart(
     userMsgStub: msg,
   }).catch((err) => {
     log.error("hermes: orchestrator crashed on start", {
+      projectId,
+      err: String(err),
+    });
+  });
+}
+
+/**
+ * Adopt an existing plain Claude Code session thread into a Hermes-managed
+ * project (RG-004). David's preferred flow: chat with `@bot` first to
+ * discuss requirements, then `/project adopt "<goal>"` once the goal is
+ * clear.
+ *
+ * Validates (in order):
+ *  1. thread has a Claude Code session in `sessions.db` (no session → reject)
+ *  2. thread has no existing Hermes project (3B soft-reject with goal preview)
+ *  3. duration string parses to ms (auto only; manual ignores duration)
+ *  4. duration ≤ maxWallHours (clamp + "capped" message)
+ *
+ * On success: builds ProjectAdoption, calls adoptProject to persist
+ * state + journal, arms the wallclock timer if auto, kicks off the
+ * orchestrator (which sends the initial plan kickoff message).
+ */
+export async function handleProjectAdopt(
+  msg: Message,
+  threadId: string,
+  thread: ThreadChannel,
+  store: SessionStore,
+  args: { goal: string; mode: "auto" | "manual"; duration?: string },
+): Promise<void> {
+  const hermesDir = resolveHermesDir(config.paths.dataDir, config.paths.hermesDir);
+
+  // 1. Pre-flight: must have a Claude Code session in this thread.
+  const session = store.get(threadId);
+  if (!session) {
+    await msg.reply(
+      `❌ No Claude Code session in this thread. Start one with \`@bot <prompt>\` first, then \`/project adopt\`.`,
+    );
+    return;
+  }
+
+  // 2. Pre-flight: no existing Hermes project on this thread.
+  const existing = findProjectByThread(hermesDir, threadId);
+  if (existing) {
+    const goalPreview = existing.goal.length > 60
+      ? existing.goal.slice(0, 60) + "…"
+      : existing.goal;
+    await msg.reply(
+      `⚠️ This thread already has a Hermes project (\`goal: ${goalPreview}\`, status=${existing.status}). ` +
+        `To re-adopt, kill it first with \`/project kill\`, or use \`/project setMode\` to change mode.`,
+    );
+    return;
+  }
+
+  // 3. Parse + clamp duration (auto only).
+  let effectiveMs: number | null = null;
+  let requestedDuration: string | undefined = args.duration;
+  let clamped = false;
+  if (args.mode === "auto") {
+    const capMs = config.hermes.maxWallHours * 60 * 60 * 1000;
+    if (args.duration !== undefined) {
+      const parsed = parseDuration(args.duration);
+      if (parsed === null) {
+        await msg.reply(
+          `❌ Cannot parse duration: \`${args.duration}\`. Try "30m" / "2h" / "1d" / "1h30m".`,
+        );
+        return;
+      }
+      effectiveMs = parsed;
+    } else {
+      effectiveMs = capMs;
+      requestedDuration = `${config.hermes.maxWallHours}h (default)`;
+    }
+    if ((effectiveMs ?? 0) > capMs) {
+      effectiveMs = capMs;
+      clamped = true;
+    }
+  }
+
+  // 4. Build the project state.
+  const projectId = randomUUID();
+  const runtime: HermesRuntimeConfig = {
+    maxIterations: config.hermes.maxIterations,
+    maxCostUsd: config.hermes.maxCostUsd,
+    maxWallHours: config.hermes.maxWallHours,
+    hermesModel: config.hermes.model,
+    maxAttemptsPerTask: config.hermes.maxAttemptsPerTask,
+  };
+  const state = adoptProject({
+    hermesDir,
+    projectId,
+    threadId,
+    goal: args.goal,
+    mode: args.mode,
+    repoPath: session.repoPath,
+    repoSource: "local", // adopt always targets an existing local CC session
+    config: runtime,
+    adoption: {
+      fromSession: true,
+      adoptedAt: new Date().toISOString(),
+      originalRepoPath: session.repoPath,
+      originalSessionId: session.claudeSession ?? "<no-session-id>",
+    },
+  });
+
+  // 5. If auto, arm a wallclock timer (mirrors handleProjectStart/setMode).
+  if (args.mode === "auto") {
+    state.timer = {
+      expiresAt: Date.now() + (effectiveMs ?? config.hermes.maxWallHours * 60 * 60 * 1000),
+      requestedDuration: requestedDuration ?? `${config.hermes.maxWallHours}h (default)`,
+      effectiveMs: effectiveMs ?? config.hermes.maxWallHours * 60 * 60 * 1000,
+      clamped,
+      // handle set by armProjectTimer below
+    };
+    saveState(hermesDir, state.id, state);
+    armProjectTimer(state, () => {
+      const fresh = loadState(hermesDir, state.id);
+      if (!fresh || !isActive(fresh)) return;
+      softExit(state.id, fresh, {
+        hermesDir,
+        thread,
+        claudeSession: null,
+      }, "duration_expired").catch((err) => {
+        log.error("hermes: handleProjectAdopt timer softExit failed", {
+          projectId: state.id,
+          err: String(err),
+        });
+      });
+    });
+  }
+
+  log.info("hermes: project adopted", {
+    projectId,
+    threadId,
+    mode: state.mode,
+    repoPath: state.repoPath,
+    adoptedFromSessionId: state.adoption?.originalSessionId,
+  });
+
+  // 6. Post kickoff message + run orchestrator (mirror handleProjectStart).
+  const capNote = clamped
+    ? ` (capped at ${config.hermes.maxWallHours}h — the safety cap)`
+    : "";
+  const timerLine = args.mode === "auto"
+    ? `\nTimer: \`${state.timer?.requestedDuration ?? `${config.hermes.maxWallHours}h`}\`${capNote}.`
+    : "";
+  await thread.send(
+    [
+      `🎯 **Hermes project adopted** (from existing CC session)`,
+      `Project: \`${projectId.slice(0, 8)}\``,
+      `Mode: \`${state.mode}\` | Repo: \`${state.repoPath}\` (local, adopted)${timerLine}`,
+      `Budget: $${(runtime.maxCostUsd / 100).toFixed(2)} | Max iters: ${runtime.maxIterations} | Wall: ${runtime.maxWallHours}h`,
+      ``,
+      `📋 Planning...`,
+    ].join("\n"),
+  );
+
+  // Fire-and-forget: let the message handler return immediately so the
+  // user's /project adopt message gets an ack. The orchestrator posts
+  // the plan and per-task messages asynchronously.
+  runProject(projectId, {
+    hermesDir,
+    thread,
+    claudeSession: session.claudeSession ?? null,
+    userMsgStub: msg,
+  }).catch((err) => {
+    log.error("hermes: adopted project orchestrator crashed", {
       projectId,
       err: String(err),
     });
@@ -622,6 +835,24 @@ export async function dispatchHermesCommand(
     return true;
   }
 
+  // /project adopt only works in a thread (the whole point is to upgrade
+  // an existing thread's CC session — top-level makes no sense).
+  const adoptMatch = matchAdopt(trimmed);
+  if (adoptMatch) {
+    if (ctx.isTopLevel) {
+      await ctx.msg.reply("❌ `/project adopt` must be invoked in an existing thread, not at the channel top level.");
+      return true;
+    }
+    await handleProjectAdopt(
+      ctx.msg,
+      threadId,
+      ctx.msg.channel as ThreadChannel,
+      ctx.store,
+      adoptMatch,
+    );
+    return true;
+  }
+
   // Hermes thread consume gate. In AUTO mode + active project, consume
   // any non-/project message so it doesn't fall through to Claude Code
   // (Hermes is orchestrating; replies are not directed at Claude Code).
@@ -639,7 +870,7 @@ export async function dispatchHermesCommand(
   }
 
   await ctx.msg.reply(
-    `❓ Unknown \`/project\` subcommand. Try: \`start\`, \`status\`, \`plan\`, \`kill\`, \`resume\`, \`setMode\`, \`list\`.`,
+    `❓ Unknown \`/project\` subcommand. Try: \`start\`, \`status\`, \`plan\`, \`kill\`, \`resume\`, \`setMode\`, \`adopt\`, \`list\`.`,
   );
   return true;
 }
