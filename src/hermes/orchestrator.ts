@@ -27,7 +27,7 @@
 import { runViaSdk, type SdkRunResult } from "../agent/sdkRunner";
 import { log } from "../logger";
 import { executeTask, type ExecutorDeps } from "./executor";
-import { planProject } from "./planner";
+import { PlannerTimeoutError, planProject } from "./planner";
 import { judgeProject } from "./judge";
 import {
   appendJournal,
@@ -230,14 +230,28 @@ export async function runProject(
       err: String(err),
       stack: err instanceof Error ? err.stack : undefined,
     });
-    state.status = "failed";
+    // RG-008: distinguish planner timeout from a generic crash. The
+    // planner throws PlannerTimeoutError when the LLM call exceeds
+    // `config.hermes.plannerTimeoutMs` (default 15min). Map it to a
+    // dedicated `timed_out` status + a clean escalation message
+    // ("🕐 planner timed out…") rather than the opaque
+    // "orchestrator crashed: Claude Code process aborted by user"
+    // string we used to see (regression 2026-06-22, 6/6 of the
+    // failed projects in /project list exhibited this).
+    const isPlannerTimeout = err instanceof PlannerTimeoutError;
+    state.status = isPlannerTimeout ? "timed_out" : "failed";
     state.endedAt = new Date().toISOString();
     saveState(deps.hermesDir, projectId, state);
     appendJournal(deps.hermesDir, projectId, {
       type: "escalate",
-      message: `orchestrator crash: ${String(err).slice(0, 300)}`,
+      message: isPlannerTimeout
+        ? `planner timed out after ${Math.round(err.timeoutMs / 1000)}s; project ${state.id.slice(0, 8)} ended in timed_out`
+        : `orchestrator crash: ${String(err).slice(0, 300)}`,
     });
-    await send(formatEscalation(state, `orchestrator crashed: ${String(err).slice(0, 200)}`));
+    const escalationMsg = isPlannerTimeout
+      ? `🕐 planner timed out after ${Math.round(err.timeoutMs / 1000)}s — goal was too complex for the planner LLM. Try /project resume with HERMES_PLANNER_TIMEOUT_MS raised, or split the goal.`
+      : `orchestrator crashed: ${String(err).slice(0, 200)}`;
+    await send(formatEscalation(state, escalationMsg));
   } finally {
     typing.stop();
   }

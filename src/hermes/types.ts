@@ -34,7 +34,8 @@ export type ProjectStatus =
   | "judging"
   | "done"
   | "failed"
-  | "killed";
+  | "killed"
+  | "timed_out"; // RG-008: planner LLM call exceeded plannerTimeoutMs (default 15min)
 
 /**
  * Sub-reason for `killed` status. The base state machine has 3 terminal

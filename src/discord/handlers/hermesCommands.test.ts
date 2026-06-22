@@ -21,16 +21,20 @@ import {
   matchSetMode,
   handleProjectSetMode,
   handleProjectAdopt,
+  handleProjectKill,
+  handleProjectResume,
 } from "./hermesCommands";
 import type { Message, ThreadChannel } from "discord.js";
 import { ensureProjectDir, loadState, saveState } from "../../hermes/state";
+import { config } from "../../config";
+import { PlannerTimeoutError } from "../../hermes/planner";
+import { formatEscalation } from "../../hermes/discord";
 import {
   DEFAULT_HERMES_CONFIG,
   isActive,
   newProjectState,
   type ProjectState,
 } from "../../hermes/types";
-import { config } from "../../config";
 
 // ── Mock runProject so we can audit auto-resume without spawning CC ────
 // `mock.module` is hoisted by bun to run before the test file's
@@ -1227,5 +1231,296 @@ describe("RG-007: /project adopt auto-kills same-repoRoot conflicts", () => {
     // thread.send.
     expect(threadSends.some((s) => s.includes("Hermes project adopted"))).toBe(true);
     expect(threadSends.some((s) => s.includes("Planning"))).toBe(true);
+  });
+});
+
+/**
+ * RG-008 audit: planner timeout / kill-reason / timed_out status.
+ *
+ * Background (regression 2026-06-22):
+ *   On 2026-06-22, after shipping RG-002 / UX-3 / RG-004 / RG-005
+ *   / RG-006 / RG-007, David ran `/project list` and noticed that
+ *   6 of the 9 most recent Hermes projects had `status=failed`. The
+ *   Discord threads for those projects all displayed the opaque
+ *   message `🪪 Hermes: ⚠️ escalated: orchestrator crashed: Error:
+ *   Claude Code process aborted by user — reply or /project kill`.
+ *
+ *   Root-cause analysis (data/bot.log + journal.log):
+ *   - `planner.ts:22` had a hardcoded `PLANNER_TIMEOUT_MS = 5 * 60
+ *     * 1000` (5 minutes). Five minutes was too short for the
+ *     planning LLM call on complex existing repos (e.g. the
+ *     `aged-system` project, which had multi-sprint history).
+ *   - When the timeout fired, `ac.abort()` triggered the CC SDK's
+ *     `DirectConnectTransport` abort handler which threw
+ *     `Error: Connection aborted by user`. The error propagated up
+ *     through the planner's `for await` loop → `doPlanning` →
+ *     `runProject`'s catch block → was mapped to
+ *     `formatEscalation(state, "orchestrator crashed: ...")`.
+ *   - The orchestrator's catch made no distinction between a
+ *     planner timeout and a real crash, so the user saw a
+ *     misleading "aborted by user" string instead of a clean
+ *     "planner timed out after 5min" message.
+ *
+ *   Secondary finding: `handleProjectKill` set `state.status =
+ *   "killed"` and `state.endedAt` but never populated
+ *   `state.killedReason`, so a `/project kill` was
+ *   indistinguishable from a `duration_expired` or `manual_switch`
+ *   kill in `/project status` and journal reads.
+ *
+ * The 12 invariants below cover both the primary fix (planner
+ * timeout) and the secondary fix (kill-reason).
+ *
+ * Invariant summary:
+ *   I-1  PlannerTimeoutError is a real Error subclass with a
+ *        `timeoutMs` field and a useful `message`.
+ *   I-2  PlannerTimeoutError is thrown when the planner LLM call
+ *        exceeds `config.hermes.plannerTimeoutMs` (default 15min).
+ *   I-3  config.hermes.plannerTimeoutMs is exposed (env
+ *        HERMES_PLANNER_TIMEOUT_MS, default 15min).
+ *   I-4  ProjectStatus union includes the new "timed_out" variant.
+ *   I-5  handleProjectKill populates state.killedReason = "user_kill".
+ *   I-6  handleProjectKill appends a structured journal entry of
+ *        type="status" with the threadId.
+ *   I-7  handleProjectKill clears state.currentTaskId.
+ *   I-8  handleProjectKill no-ops with a friendly message on
+ *        already-terminal projects (including the new "timed_out").
+ *   I-9  handleProjectResume accepts "timed_out" as a resumable
+ *        terminal state (in addition to killed/failed).
+ *   I-10 The orchestrator's catch block maps a PlannerTimeoutError
+ *        to status="timed_out" (not "failed") and posts a clean
+ *        "🕐 planner timed out" escalation message.
+ *   I-11 A non-timeout error in the orchestrator's catch still
+ *        sets status="failed" (regression guard: the new timed_out
+ *        path doesn't leak into generic failures).
+ *   I-12 formatEscalation accepts a longer reason string and does
+ *        not truncate the planner-timeout message below the
+ *        readable length.
+ */
+describe("RG-008: planner timeout / kill-reason / timed_out status", () => {
+  let hermesDir: string;
+
+  // FakeMessage that captures both .reply (status messages) and the
+  // thread.send path (escalation messages that hit the thread, not
+  // the parent channel). Mirrors the RG-007 fake.
+  const newFakeMsg = () => {
+    const replies: string[] = [];
+    const threadSends: string[] = [];
+    const msg = {
+      reply: (c: string) => {
+        replies.push(c);
+        return Promise.resolve();
+      },
+      channel: {
+        send: (c: string) => {
+          threadSends.push(c);
+          return Promise.resolve();
+        },
+      } as unknown as ThreadChannel,
+      author: { id: "test-user", bot: false },
+      client: { user: { id: "bot-1" } },
+      channelId: "test-channel",
+      content: "/project kill",
+      mentions: { users: { size: 0, has: () => false } },
+    } as unknown as Message;
+    return { msg, replies, threadSends };
+  };
+
+  // Build an active (planning/executing/judging) project. Override
+  // status to set the desired pre-state.
+  const makeActiveProject = (
+    overrides: Partial<ProjectState> = {},
+  ): ProjectState => {
+    const tag = Math.random().toString(36).slice(2, 10);
+    const s = newProjectState({
+      id: `p-rg008-${tag}`,
+      threadId: `thread-rg008-${tag}`,
+      goal: "rg008 audit",
+      mode: "auto",
+      repoPath: "/tmp/rg008",
+      repoRoot: "/tmp/rg008",
+      repoSource: "local",
+      config: DEFAULT_HERMES_CONFIG,
+    });
+    s.status = "executing";
+    s.currentTaskId = "t1";
+    s.startedAt = new Date(Date.now() - 1000).toISOString();
+    return { ...s, ...overrides };
+  };
+
+  const cleanupIds: string[] = [];
+
+  beforeEach(() => {
+    const baseDataDir = process.env.DATA_DIR ?? "/tmp/claude-bridge-test-data";
+    hermesDir = join(baseDataDir, "hermes");
+    // Pre-test wipe of any leftover rg008 projects.
+    cleanupIds.length = 0;
+  });
+
+  afterEach(() => {
+    const { rmSync } = require("node:fs") as typeof import("node:fs");
+    for (const id of cleanupIds) {
+      rmSync(join(hermesDir, "projects", id), {
+        recursive: true,
+        force: true,
+      });
+    }
+  });
+
+  // I-1: PlannerTimeoutError is a real Error subclass.
+  test("I-1: PlannerTimeoutError has correct name/message/timeoutMs", () => {
+    const err = new PlannerTimeoutError(15 * 60 * 1000);
+    expect(err).toBeInstanceOf(Error);
+    expect(err).toBeInstanceOf(PlannerTimeoutError);
+    expect(err.name).toBe("PlannerTimeoutError");
+    expect(err.timeoutMs).toBe(15 * 60 * 1000);
+    // The message uses `Math.round(timeoutMs / 1000)s` so 15min (900s)
+    // is the actual rendered form. The test asserts on that
+    // deterministic format (not on the colloquial "15min" string).
+    expect(err.message).toContain("900s");
+    expect(err.message).toContain("planner timed out");
+  });
+
+  // I-3: config exposes plannerTimeoutMs.
+  test("I-3: config.hermes.plannerTimeoutMs is exposed (default 15min)", () => {
+    expect(config.hermes.plannerTimeoutMs).toBe(15 * 60 * 1000);
+  });
+
+  // I-4: ProjectStatus union includes "timed_out".
+  test("I-4: ProjectStatus union accepts 'timed_out'", () => {
+    const s = makeActiveProject({ status: "timed_out" });
+    expect(s.status).toBe("timed_out");
+    expect(isActive(s)).toBe(false); // terminal, not active
+  });
+
+  // I-5: handleProjectKill populates state.killedReason = "user_kill".
+  test("I-5: /project kill on active project sets killedReason='user_kill'", async () => {
+    const s = makeActiveProject();
+    ensureProjectDir(hermesDir, s.id);
+    saveState(hermesDir, s.id, s);
+    cleanupIds.push(s.id);
+    const { msg } = newFakeMsg();
+    await handleProjectKill(msg, s.threadId);
+    const reloaded = loadState(hermesDir, s.id);
+    expect(reloaded).not.toBeNull();
+    expect(reloaded!.status).toBe("killed");
+    expect(reloaded!.killedReason).toBe("user_kill");
+    expect(reloaded!.endedAt).not.toBeNull();
+  });
+
+  // I-6: handleProjectKill appends a journal entry of type="status".
+  test("I-6: /project kill appends a 'status' journal entry", async () => {
+    const s = makeActiveProject();
+    ensureProjectDir(hermesDir, s.id);
+    saveState(hermesDir, s.id, s);
+    cleanupIds.push(s.id);
+    const { msg } = newFakeMsg();
+    await handleProjectKill(msg, s.threadId);
+    const journalPath = join(hermesDir, "projects", s.id, "journal.log");
+    const journalContent = readFileSync(journalPath, "utf-8");
+    // The journal line is `[ISO] [status] user typed /project kill (...)`.
+    // We don't pin the exact timestamp — just assert the structured
+    // fields are present.
+    expect(journalContent).toMatch(/\[status\] user typed \/project kill/);
+    expect(journalContent).toContain(s.threadId);
+  });
+
+  // I-7: handleProjectKill clears state.currentTaskId.
+  test("I-7: /project kill clears state.currentTaskId", async () => {
+    const s = makeActiveProject();
+    s.currentTaskId = "t3";
+    ensureProjectDir(hermesDir, s.id);
+    saveState(hermesDir, s.id, s);
+    cleanupIds.push(s.id);
+    const { msg } = newFakeMsg();
+    await handleProjectKill(msg, s.threadId);
+    const reloaded = loadState(hermesDir, s.id);
+    expect(reloaded!.currentTaskId).toBeNull();
+  });
+
+  // I-8: handleProjectKill no-ops on already-terminal projects,
+  // including the new "timed_out" status.
+  test("I-8: /project kill on timed_out project is a friendly no-op", async () => {
+    const s = makeActiveProject({
+      status: "timed_out",
+      killedReason: undefined,
+    });
+    s.endedAt = new Date().toISOString();
+    ensureProjectDir(hermesDir, s.id);
+    saveState(hermesDir, s.id, s);
+    cleanupIds.push(s.id);
+    const { msg, replies } = newFakeMsg();
+    await handleProjectKill(msg, s.threadId);
+    expect(replies.length).toBe(1);
+    expect(replies[0]).toContain("timed_out");
+    // The status was not changed.
+    const reloaded = loadState(hermesDir, s.id);
+    expect(reloaded!.status).toBe("timed_out");
+  });
+
+  // I-9: handleProjectResume accepts "timed_out" as a resumable
+  // terminal state. We mock runProject via the same pattern RG-006
+  // uses (the test file imports the real handleProjectResume and
+  // the test does NOT need runProject to actually run — we just
+  // need to see that the gate allows it through and triggers
+  // runProject). Since handleProjectResume fire-and-forgets
+  // runProject, we can detect the call via a try/catch on a
+  // "fake" project.
+  test("I-9: /project resume accepts 'timed_out' as a resumable state", async () => {
+    const s = makeActiveProject({
+      status: "timed_out",
+      killedReason: undefined,
+    });
+    s.endedAt = new Date().toISOString();
+    ensureProjectDir(hermesDir, s.id);
+    saveState(hermesDir, s.id, s);
+    cleanupIds.push(s.id);
+    // Reset the global runProjectCalls counter (used by the
+    // orchestrator mock) so we can detect the resume call.
+    runProjectCalls = [];
+    const { msg, replies } = newFakeMsg();
+    // Build a SessionStore mock that returns null (no existing
+    // session) — sufficient for the gate check.
+    const store = { get: () => null };
+    const thread = msg.channel as unknown as ThreadChannel;
+    // We don't await runProject (it can run forever); the handler
+    // itself should return quickly after kicking it off.
+    await handleProjectResume(msg, s.threadId, thread, store as never);
+    // The handler replied with a "Resuming project..." message.
+    expect(replies.some((r) => r.includes("Resuming"))).toBe(true);
+    // The handler also re-saved the state with status="executing"
+    // (the gate's reset step) — verify it.
+    const reloaded = loadState(hermesDir, s.id);
+    expect(reloaded!.status).toBe("executing");
+  });
+
+  // I-10: PlannerTimeoutError → status="timed_out" + clean escalation.
+  // NOTE: This invariant is covered by orchestratorRG008.test.ts
+  // ("I-10: PlannerTimeoutError → status='timed_out' + '🕐' escalation")
+  // because the existing mock.module("../../hermes/orchestrator")
+  // hoists runProject to a no-op. The companion file uses a fresh
+  // module graph to exercise the REAL catch block. We keep the
+  // invariant number reserved here so docs/REGRESSION-GUARD.md
+  // numbering matches this test file.
+
+  // I-11: see I-10 note (covered in orchestratorRG008.test.ts).
+
+  // I-12: formatEscalation preserves the planner-timeout message
+  // length (the helper truncates to 120 chars, but the 🕐 + "900s"
+  // + "planner" tokens must survive the truncation so the user can
+  // see the cause in the Discord notification).
+  test("I-12: formatEscalation preserves key planner-timeout tokens", () => {
+    const s = makeActiveProject({ status: "timed_out" });
+    const reason =
+      "🕐 planner timed out after 900s — goal was too complex for the planner LLM. Try /project resume with HERMES_PLANNER_TIMEOUT_MS raised, or split the goal.";
+    const msg = formatEscalation(s, reason);
+    // The formatEscalation helper truncates to 120 chars and adds
+    // the prefix. The key tokens ("🕐", "planner", "timed out")
+    // must all survive — i.e. the start of the reason is preserved.
+    expect(msg).toContain("🕐");
+    expect(msg).toContain("planner");
+    expect(msg).toContain("timed out");
+    // And the generic "aborted by user" string from the old
+    // message must NOT appear.
+    expect(msg).not.toContain("aborted by user");
   });
 });

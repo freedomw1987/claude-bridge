@@ -19,7 +19,38 @@ import { log } from "../logger";
 import { z } from "zod";
 import type { Task } from "./types";
 
-const PLANNER_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
+/**
+ * RG-008 (regression 2026-06-22): the previous hardcoded 5-minute
+ * timeout was too short for some goals (e.g. complex existing repos
+ * with multi-sprint history) where the planner LLM call legitimately
+ * needed > 5min. The abort triggered the CC SDK's "Connection
+ * aborted by user" error path, which propagated to the orchestrator
+ * as the opaque message "orchestrator crashed: Error: Claude Code
+ * process aborted by user". Default is now 15min, configurable via
+ * `config.hermes.plannerTimeoutMs` (env HERMES_PLANNER_TIMEOUT_MS).
+ *
+ * On expiry we throw a `PlannerTimeoutError` (subclass of Error) so
+ * the orchestrator's catch can recognize the timeout specifically and
+ * transition the project to status="timed_out" with a clean
+ * escalation message — distinct from a generic failure.
+ */
+
+/**
+ * Thrown by `planProject` when the planner LLM call exceeds
+ * `config.hermes.plannerTimeoutMs`. The orchestrator's catch block
+ * matches on `instanceof PlannerTimeoutError` to set status="timed_out"
+ * and post a "🕐 planner timed out" escalation (vs. a generic
+ * "aborted by user" message). Carries the effective timeout in ms so
+ * the message can be specific ("timed out after 15min").
+ */
+export class PlannerTimeoutError extends Error {
+  readonly timeoutMs: number;
+  constructor(timeoutMs: number) {
+    super(`planner timed out after ${Math.round(timeoutMs / 1000)}s`);
+    this.name = "PlannerTimeoutError";
+    this.timeoutMs = timeoutMs;
+  }
+}
 
 const PLAN_TASK_SCHEMA = z.object({
   id: z.string().regex(/^t\d+$/, "task id must match t<digits>"),
@@ -77,7 +108,11 @@ export async function planProject(input: {
 }): Promise<PlanResult> {
   const model = input.model ?? config.hermes.model;
   const ac = new AbortController();
-  const timer = setTimeout(() => ac.abort(), PLANNER_TIMEOUT_MS);
+  // RG-008: timeout is configurable via config.hermes.plannerTimeoutMs
+  // (env HERMES_PLANNER_TIMEOUT_MS, default 15min). See PlannerTimeoutError
+  // doc above for why this is no longer hardcoded to 5min.
+  const plannerTimeoutMs = config.hermes.plannerTimeoutMs;
+  const timer = setTimeout(() => ac.abort(), plannerTimeoutMs);
 
   const userPrompt = `# Chairman's Goal
 ${input.goal}
@@ -122,6 +157,16 @@ Decompose the goal into 3-10 concrete tasks. Return JSON only.`;
   let turns = 0;
   try {
     for await (const msg of q as AsyncIterable<SDKMessage>) {
+      // RG-008: detect a timeout (the AbortController was triggered
+      // by our setTimeout above) and translate it into a
+      // PlannerTimeoutError. Without this, the SDK would surface the
+      // generic "Connection aborted by user" string and the
+      // orchestrator would have no way to distinguish a timeout from
+      // a real crash. The for-await may still yield a final message
+      // after abort, so we check before processing each one.
+      if (ac.signal.aborted) {
+        throw new PlannerTimeoutError(plannerTimeoutMs);
+      }
       if (msg.type === "assistant") {
         turns++;
         for (const block of msg.message.content) {

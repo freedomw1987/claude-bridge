@@ -87,6 +87,17 @@ export const config = {
     maxCostUsd: optionalInt("HERMES_MAX_COST_USD", 500), // in cents; displayed as $5.00
     maxWallHours: optionalInt("HERMES_MAX_WALL_HOURS", 4),
     maxAttemptsPerTask: optionalInt("HERMES_MAX_ATTEMPTS_PER_TASK", 3),
+    // Hard cap on the planner LLM call (the SDK query that decomposes
+    // a goal into 3-10 tasks). When exceeded, the planner throws a
+    // PlannerTimeoutError which the orchestrator catches and
+    // transitions the project to status="timed_out" with a clean
+    // escalation message — instead of the opaque "aborted by user"
+    // string we used to see in RG-008 (regression 2026-06-22). The
+    // 5-minute default was too short for some goals (e.g. complex
+    // existing-code repos with multi-sprint history) where the
+    // planner LLM call legitimately needs > 5min. Default raised to
+    // 15 minutes. Override via HERMES_PLANNER_TIMEOUT_MS (in ms).
+    plannerTimeoutMs: optionalInt("HERMES_PLANNER_TIMEOUT_MS", 15 * 60 * 1000),
     // When non-empty, resume any active projects on bot startup. Set to 0
     // to disable auto-resume (manual /project resume only).
     resumeOnStartup: optional("HERMES_RESUME_ON_STARTUP", "1") === "1",

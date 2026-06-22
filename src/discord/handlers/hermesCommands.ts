@@ -645,13 +645,32 @@ export async function handleProjectKill(
     await msg.reply(`❌ No Hermes project in this thread.`);
     return;
   }
-  if (state.status === "done" || state.status === "failed" || state.status === "killed") {
+  if (state.status === "done" || state.status === "failed" || state.status === "killed" || state.status === "timed_out") {
     await msg.reply(`Project is already \`${state.status}\`.`);
     return;
   }
+  // RG-008 (regression 2026-06-22): the previous implementation set
+  // `state.status = "killed"` and `state.endedAt` but never
+  // populated `state.killedReason`. The downstream consumers
+  // (`formatStatusEmbed`, `/project status`, journal reads) then
+  // showed `killedReason: undefined` for user-initiated kills,
+  // indistinguishable from duration_expired / manual_switch /
+  // superseded_by_X. Fix: write "user_kill" so the audit trail
+  // distinguishes the four kill paths. (The other three paths
+  // already write their own killedReason in softExit, in
+  // handleProjectAdopt, and the duration_expired branch in
+  // softExit.) Also append a journal entry so the kill is
+  // visible in the audit log with a structured message instead
+  // of leaving a silent state transition.
   state.status = "killed";
+  state.killedReason = "user_kill";
   state.endedAt = new Date().toISOString();
+  state.currentTaskId = null;
   saveState(hermesDir, state.id, state);
+  appendJournal(hermesDir, state.id, {
+    type: "status",
+    message: `user typed /project kill (threadId=${threadId})`,
+  });
   // Also abort any in-flight SDK run on this thread so the current
   // Claude Code task stops sooner (instead of running to completion).
   // The orchestrator's main loop also re-reads state.json between
@@ -681,7 +700,7 @@ export async function handleProjectResume(
     await msg.reply(`❌ No Hermes project in this thread.`);
     return;
   }
-  if (state.status !== "killed" && state.status !== "failed") {
+  if (state.status !== "killed" && state.status !== "failed" && state.status !== "timed_out") {
     await msg.reply(`Project is \`${state.status}\`; nothing to resume.`);
     return;
   }
