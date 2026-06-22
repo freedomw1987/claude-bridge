@@ -3,6 +3,7 @@
 > Live status. Updated as work progresses.
 
 ## Current Phase: Weeks 1, 2, 4 complete ✅ + Project Registry ✅ — Week 3 abandoned
+**+ Phase 1.5 follow-up ✅ — Phase 2 (time-bounded auto mode) proposed**
 
 ## Status
 
@@ -16,6 +17,8 @@
 - [~] **Week 3 deliverable** — Docker containerization — **abandoned** (see MILESTONES.md)
 - [x] **Week 4 deliverable** — Streaming, slash commands, graceful shutdown, deploy
 - [x] **Project registry** — Auto-discover `~/www/`, project name resolution, `new <name>` syntax
+- [x] **Hermes agent (ADR-0003)** — `/project start`, planning/executing/judging state machine
+- [ ] **Phase 2 (ADR-0004)** — Time-bounded auto mode — see [ADR](operations/0004-setmode-auto-duration.md) and [MILESTONES §Phase 2](MILESTONES.md)
 
 ## Project Registry ✅
 

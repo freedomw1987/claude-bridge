@@ -69,6 +69,18 @@ Discord Channel
 - Graceful shutdown: SIGTERM all in-flight subprocesses on `SIGINT` / `SIGTERM`
 - (Future) Idle-timeout sweep is reserved but not yet implemented — *implemented in v1.0.1*
 
+### F7 — Time-bounded auto mode (Phase 1.5)
+- `/project setMode auto <duration>` — give Hermes autonomous control of a project
+  for a user-set wallclock window. `<duration>` accepts `30m` / `2h` / `1d` /
+  `1h30m` formats; defaults to the `HERMES_MAX_WALL_HOURS` cap.
+- Soft-exit at the next `judging` boundary (not at task boundary) when the
+  timer fires. Project status → `killed` with reason `duration_expired`.
+- `/project setMode manual` cancels any active timer and returns to direct
+  Claude Code conversation.
+- Bot restart preserves the timer (re-armed from `state.timer.expiresAt`
+  minus elapsed wallclock).
+- See [ADR-0004](operations/0004-setmode-auto-duration.md).
+
 ## Non-functional Requirements
 
 - **Latency**: First claude response within 10s of mention

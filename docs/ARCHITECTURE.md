@@ -148,6 +148,7 @@ Meanwhile (on bot restart):
 | `src/hermes/judge.ts` | LLM-based self-assessment. Verdict shapes: `done` / `needs_more` (with new tasks) / `stuck`. |
 | `src/hermes/executor.ts` | Wraps `runViaSdk` with task semantics: builds the task prompt from goal + previous task outcomes, tracks `attempts` and `lastError`. |
 | `src/hermes/orchestrator.ts` | Main state machine: `planning → executing ⇄ judging → done \| failed \| killed`. Safety caps check (`shouldStop`), per-task retry, judge loop. Includes `resumeActiveProjects()` for bot restart recovery. |
+| `src/hermes/duration.ts` | `parseDuration(s)` — parses `"30m"` / `"2h"` / `"1d"` / `"1h30m"` strings into ms. Used by `/project setMode auto <duration>`. See [ADR-0004](operations/0004-setmode-auto-duration.md). |
 | `src/hermes/typing.ts` | `TypingIndicator` class — keeps Discord typing on for the whole orchestrator run. 8s refresh (Discord typing expires at 10s). `unref`'d for safety. |
 | `src/hermes/discord.ts` | Embed/format helpers: `formatPlanMessage`, `formatTaskStart`, `formatTaskDone`, `formatCompletion`, `formatEscalation`, `formatStatusEmbed`, `HERMES_PREFIX` (`🪪 Hermes:`). |
 | `src/db/index.ts` | bun:sqlite wrapper, schema migration (additive for `mode`, `runner_kind`, etc.), typed CRUD on sessions |
@@ -370,6 +371,13 @@ Deliverable → David
 - **State on disk** (`<HERMES_DIR>/projects/<uuid>/`): `state.json` (atomic),
   `plan.md` (human-readable), `journal.log` (append-only). Not in SQLite —
   the project tree IS the source of truth.
+- **Time-bounded auto mode** (`/project setMode auto <duration>`, ADR-0004):
+  user-facing affordance to give Hermes autonomous control for a fixed
+  wallclock window. Soft-exit at the next `judging` boundary when the
+  timer fires; status lands in `killed` with reason `duration_expired`.
+  `<duration>` is parsed as `30m` / `2h` / `1d` / `1h30m` and clamped
+  to `HERMES_MAX_WALL_HOURS` as a safety floor. See
+  [ADR-0004](operations/0004-setmode-auto-duration.md).
 - **One project = one Discord thread.** The thread ID maps to a single
   project. `/project start` creates the thread; subsequent `/project status`
   etc. operate in the existing thread.

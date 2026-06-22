@@ -230,6 +230,70 @@ called `discord_send`. Duplicates are possible but rare and tolerable.
 
 ---
 
+## Phase 2 — Time-bounded auto mode (proposed)
+
+**Goal**: extend `/project setMode` with a user-set wallclock duration
+so David can give Hermes autonomous control of a project for a bounded
+window without babysitting.
+
+### Tasks
+- [ ] M2.1: `src/hermes/duration.ts` — `parseDuration(s)` parser + tests
+- [ ] M2.2: `src/hermes/types.ts` — add `ProjectTimer` to `ProjectState`
+- [ ] M2.3: `src/hermes/state.ts` — persist `timer` (without `handle`) in
+  `state.json`; hydrate on `loadState`
+- [ ] M2.4: `src/hermes/orchestrator.ts` — `softExit(projectId)` helper;
+  call at `judging → verdict` transition when `state.timer.expiresAt` past
+- [ ] M2.5: `src/index.ts` — `resumeActiveProjects` re-arms `setTimeout`
+  from persisted `expiresAt`; auto-`softExit` if already past
+- [ ] M2.6: `hermesCommands.ts` — `matchSetMode` accepts optional duration;
+  `handleProjectSetMode` parses, clamps to cap, sets/clears timer
+- [ ] M2.7: `hermesCommands.ts` — relax `setMode auto` gate to allow
+  active projects (with timer); keep `setMode manual` cancel logic
+- [ ] M2.8: `src/hermes/discord.ts` — `formatStatusEmbed` adds
+  `timer: M:SS remaining` line when `state.timer` is set
+- [ ] M2.9: docs — `PRD.md` (F7), `ARCHITECTURE.md` (state-machine diagram
+  + duration_expired branch), `MILESTONES.md` (this entry), `taskboard.md`
+  (status section), ADR-0004 (already written)
+- [ ] M2.10: tests — `parseDuration` cases, timer set/clear, `softExit`
+  boundary check, bot-restart re-hydration
+- [ ] M2.11: E2E manual smoke — `/project setMode auto 1m` then wait
+  70s, observe `duration_expired` message at next judge pass
+
+### Deliverable
+`/project setMode auto 30m` gives a 30-minute autonomous window. Status
+embed shows live countdown. Timer fires at next judge boundary → project
+transitions to `killed (duration_expired)`. User can `/project resume`
+without the old timer, or `/project setMode auto 1h` to start a fresh
+window. Bot restart mid-run preserves the timer (re-armed with elapsed
+time subtracted).
+
+### Out of scope
+- Per-task timer (only project-level)
+- Auto-extension at high usage
+- Slack/Telegram adapters
+
+### Rollback
+`rm src/hermes/duration.ts src/hermes/duration.test.ts` + revert commit.
+No SQLite migration. Older `state.json` files load fine (new `timer`
+field is optional).
+
+### Notes
+- The existing `HERMES_MAX_WALL_HOURS=4` cap is treated as a **floor**:
+  `effective_duration = min(user_duration, HERMES_MAX_WALL_HOURS * 3600000)`.
+  If the user types `1d` with a 4h cap, the start message tells them
+  "⏱ Capped at 4h (the safety cap)."
+- Soft-exit at judge boundary (not task boundary) — see ADR-0004 §"Why
+  soft-exit at judge verdict, not at task boundary" for the trade-off
+  analysis (idempotency, cost, alignment with existing judge-state
+  intent check).
+- Bot-restart re-hydration: `state.timer.expiresAt` is wallclock ms; the
+  new `setTimeout(softExit, expiresAt - Date.now())` automatically
+  accounts for elapsed time. If `expiresAt < Date.now()` at restart, we
+  immediately `softExit` and post a `🔄 Hermes project resumed
+  (timer already expired)` notice.
+
+---
+
 ## Phase 3 — Remove CLI runner (not started)
 
 Stable for ≥2 weeks on SDK, then delete `src/agent/runner.ts` and
