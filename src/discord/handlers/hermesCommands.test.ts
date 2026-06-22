@@ -1,9 +1,14 @@
 /**
- * Tests for hermesCommands.ts — command matchers and parseStartArgs.
- * Does NOT exercise full handler dispatch (requires Discord mocks).
+ * Tests for hermesCommands.ts — command matchers, parseStartArgs, and
+ * the RG-006 auto-resume behavior of handleProjectSetMode.
+ *
+ * Does NOT exercise the full dispatch loop (requires Discord client
+ * mocks); instead tests the handler directly with a fake Message.
  */
 
-import { describe, test, expect } from "bun:test";
+import { describe, test, expect, beforeEach, afterEach, mock } from "bun:test";
+import { readFileSync } from "node:fs";
+import { join } from "node:path";
 import {
   isProjectCommand,
   matchAdopt,
@@ -14,7 +19,44 @@ import {
   matchKill,
   matchResume,
   matchSetMode,
+  handleProjectSetMode,
 } from "./hermesCommands";
+import type { Message, ThreadChannel } from "discord.js";
+import { ensureProjectDir, loadState, saveState } from "../../hermes/state";
+import {
+  DEFAULT_HERMES_CONFIG,
+  newProjectState,
+  type ProjectState,
+} from "../../hermes/types";
+import { config } from "../../config";
+
+// ── Mock runProject so we can audit auto-resume without spawning CC ────
+// `mock.module` is hoisted by bun to run before the test file's
+// top-level imports resolve, so hermesCommands.ts picks up this fake
+// instead of the real orchestrator.runProject. We capture the call
+// args in a module-scoped variable so each test can assert against it.
+let runProjectCalls: Array<{ projectId: string; hasUserMsgStub: boolean; claudeSession: string | null }> = [];
+mock.module("../../hermes/orchestrator", () => {
+  return {
+    runProject: async (
+      projectId: string,
+      deps: { claudeSession: string | null; userMsgStub?: Message },
+    ) => {
+      runProjectCalls.push({
+        projectId,
+        claudeSession: deps.claudeSession,
+        hasUserMsgStub: deps.userMsgStub !== undefined,
+      });
+    },
+    armProjectTimer: () => null, // not used in these tests; no-op
+    softExit: async () => {
+      throw new Error("softExit should not be called in these tests");
+    },
+    adoptProject: async () => {
+      throw new Error("adoptProject should not be called in these tests");
+    },
+  };
+});
 
 describe("command matchers", () => {
   describe("isProjectCommand", () => {
@@ -382,5 +424,270 @@ describe("matchAdopt", () => {
   test("rejects non-/project content", () => {
     expect(matchAdopt("adopt \"abcd\"")).toBeNull();
     expect(matchAdopt("hello world")).toBeNull();
+  });
+});
+
+
+// ── RG-006: /project setMode auto auto-resumes terminal project ──────
+//
+// Before RG-006, `/project setMode auto` on a terminal project (status:
+// killed/failed/done, e.g. after a prior `setMode manual` soft-exit)
+// only flipped state.mode + armed the timer; the user then also had to
+// type `/project resume` to actually restart the orchestrator. The fix
+// (hermesCommands.ts handleProjectSetMode, post-RG-006) auto-resumes a
+// terminal project transparently. These tests pin the 7 invariants below.
+//
+//   I-1  setMode auto on a TERMINAL project triggers runProject
+//   I-2  setMode auto on a TERMINAL project sets status="executing" + clears endedAt
+//   I-3  setMode auto on a TERMINAL project appends a journal entry "auto-resumed ..."
+//   I-4  setMode auto on an ACTIVE project does NOT call runProject
+//   I-5  setMode manual on any project does NOT call runProject
+//   I-6  setMode auto without duration uses the safety cap default (4h)
+//   I-7  The reply message hints "resuming orchestrator" when terminal
+
+describe("RG-006: setMode auto auto-resumes terminal project", () => {
+  let hermesDir: string;
+  let state: ProjectState;
+
+  // FakeMessage mirrors the surface handleProjectSetMode needs:
+  //   - .reply(string) → records the message
+  //   - .channel      → cast to ThreadChannel (orchestrator mock doesn't use it)
+  const newFakeMessage = () => {
+    const replies: string[] = [];
+    const msg = {
+      reply: (content: string) => {
+        replies.push(content);
+        return Promise.resolve();
+      },
+      channel: {} as ThreadChannel,
+      author: { id: "test-user", bot: false },
+      client: { user: { id: "bot-1" } },
+      channelId: "test-channel",
+      content: "/project setMode auto",
+      mentions: { users: { size: 0, has: () => false } },
+    } as unknown as Message;
+    return { msg, replies };
+  };
+
+  // Minimal SessionStore-shaped mock. handleProjectSetMode only calls
+  // store.get(threadId) (with optional `.claudeSession`), so a stub
+  // that returns null is sufficient for these tests.
+  const newFakeStore = (claudeSession: string | null = null) => {
+    return {
+      get: () => (claudeSession ? { claudeSession } : null),
+    };
+  };
+
+  // Build a project state suitable for the test scenario. Defaults to
+  // an active (executing) project; override status/mode/timer to
+  // simulate the desired pre-state. Each project gets a unique id AND
+  // a unique threadId so findProjectByThread can't accidentally match
+  // a sibling test's project.
+  const makeProject = (
+    overrides: Partial<ProjectState> = {},
+  ): ProjectState => {
+    const tag = Math.random().toString(36).slice(2, 8);
+    const s = newProjectState({
+      id: `p-rg006-${tag}`,
+      threadId: `thread-rg006-${tag}`,
+      goal: "rg006 audit",
+      mode: "manual",
+      repoPath: "/tmp/rg006",
+      repoSource: "local",
+      config: DEFAULT_HERMES_CONFIG,
+    });
+    s.status = "killed";
+    s.killedReason = "user_kill";
+    s.endedAt = new Date().toISOString();
+    s.startedAt = new Date(Date.now() - 1000).toISOString();
+    return { ...s, ...overrides };
+  };
+
+  beforeEach(() => {
+    runProjectCalls = [];
+    // handleProjectSetMode resolves the hermes dir via
+    // resolveHermesDir(config.paths.dataDir, config.paths.hermesDir).
+    // `dataDir` is pinned by test-setup.ts to /tmp/claude-bridge-test-data
+    // and `hermesDir` is cleared so the resolver falls through to
+    // <dataDir>/hermes. Each test uses a unique projectId (see
+    // makeProject) to avoid cross-test pollution since hermesDir is
+    // shared across tests.
+    const baseDataDir = process.env.DATA_DIR ?? "/tmp/claude-bridge-test-data";
+    hermesDir = join(baseDataDir, "hermes");
+    state = makeProject();
+    ensureProjectDir(hermesDir, state.id);
+    saveState(hermesDir, state.id, state);
+  });
+
+  afterEach(() => {
+    // Clean up the per-test project dir to avoid journal/state pollution
+    // between tests, but keep the parent hermes root in place for the
+    // next test.
+    if (state?.id) {
+      const { rmSync } = require("node:fs") as typeof import("node:fs");
+      rmSync(join(hermesDir, "projects", state.id), {
+        recursive: true,
+        force: true,
+      });
+    }
+  });
+
+  // I-1: terminal → runProject is called with the right projectId
+  test("I-1: setMode auto on a TERMINAL project triggers runProject", async () => {
+    expect(state.status).toBe("killed"); // sanity: pre-condition is terminal
+    const { msg } = newFakeMessage();
+    const store = newFakeStore("sess-abc");
+
+    await handleProjectSetMode(msg, state.threadId, "auto", undefined, store as never);
+
+    expect(runProjectCalls).toHaveLength(1);
+    expect(runProjectCalls[0].projectId).toBe(state.id);
+    // The handler passes `userMsgStub: msg` so the orchestrator can use
+    // it as the SDK's first arg. Verify it's wired through.
+    expect(runProjectCalls[0].hasUserMsgStub).toBe(true);
+    // claudeSession is read from store.get(threadId) and passed through
+    expect(runProjectCalls[0].claudeSession).toBe("sess-abc");
+  });
+
+  // I-2: terminal → state.status flips to "executing", endedAt cleared
+  test("I-2: setMode auto on a TERMINAL project flips status to executing and clears endedAt", async () => {
+    expect(state.endedAt).not.toBeNull(); // sanity: pre-condition has endedAt
+    const { msg } = newFakeMessage();
+
+    await handleProjectSetMode(msg, state.threadId, "auto");
+
+    const after = loadState(hermesDir, state.id)!;
+    expect(after.status).toBe("executing");
+    expect(after.endedAt).toBeNull();
+    // mode should also be "auto" (timer armed regardless of resume)
+    expect(after.mode).toBe("auto");
+  });
+
+  // I-3: terminal → journal.log contains the auto-resume entry
+  test("I-3: setMode auto on a TERMINAL project appends 'auto-resumed by /project setMode auto' journal entry", async () => {
+    const { msg } = newFakeMessage();
+
+    await handleProjectSetMode(msg, state.threadId, "auto");
+
+    const journalPath = join(
+      hermesDir,
+      "projects",
+      state.id,
+      "journal.log",
+    );
+    const log = readFileSync(journalPath, "utf8");
+    // The handler appends:
+    //   `<ts> [status] mode changed → auto (timer=4h (default))`
+    //   `<ts> [status] auto-resumed by /project setMode auto (was killed)`
+    expect(log).toContain("mode changed → auto");
+    expect(log).toContain("auto-resumed by /project setMode auto");
+    // The "was <oldStatus>" suffix is part of the RG-006 contract so
+    // operators can see what state we resumed FROM.
+    expect(log).toMatch(/auto-resumed by \/project setMode auto \(was killed\)/);
+  });
+
+  // I-4: active → runProject is NOT called (loop is already running)
+  test("I-4: setMode auto on an ACTIVE project does NOT call runProject", async () => {
+    const active = makeProject({
+      status: "executing",
+      mode: "auto",
+      endedAt: null,
+      killedReason: undefined,
+    });
+    ensureProjectDir(hermesDir, active.id);
+    saveState(hermesDir, active.id, active);
+
+    const { msg } = newFakeMessage();
+    await handleProjectSetMode(msg, active.threadId, "auto");
+
+    // No resume needed — orchestrator loop is already running. Calling
+    // runProject again would spawn a second loop and race the existing
+    // one.
+    expect(runProjectCalls).toHaveLength(0);
+  });
+
+  // I-5: manual switch → runProject is NOT called (no auto-resume)
+  test("I-5: setMode manual does NOT call runProject (no auto-resume on manual switch)", async () => {
+    // Start from terminal
+    expect(state.status).toBe("killed");
+    const { msg } = newFakeMessage();
+
+    await handleProjectSetMode(msg, state.threadId, "manual");
+
+    // manual → no resume; mode flipped, no runProject call
+    expect(runProjectCalls).toHaveLength(0);
+    const after = loadState(hermesDir, state.id)!;
+    expect(after.mode).toBe("manual");
+  });
+
+  // I-6: setMode auto with no duration → uses HERMES_MAX_WALL_HOURS cap
+  test("I-6: setMode auto without duration uses the safety cap default (4h)", async () => {
+    const { msg, replies } = newFakeMessage();
+    console.log("[I-6] DATA_DIR=", process.env.DATA_DIR, "HERMES_DIR=", JSON.stringify(process.env.HERMES_DIR));
+    console.log("[I-6] config.paths.dataDir=", config.paths.dataDir, " hermesDir=", JSON.stringify(config.paths.hermesDir));
+
+    await handleProjectSetMode(msg, state.threadId, "auto");
+    console.log("[I-6] replies=", JSON.stringify(replies));
+
+    const after = loadState(hermesDir, state.id)!;
+    expect(after.timer).toBeDefined();
+    // handler formats default as "<N>h (default)" — verify both the
+    // literal marker and that it matches the configured cap
+    expect(after.timer!.requestedDuration).toContain("(default)");
+    expect(after.timer!.requestedDuration).toContain(
+      `${config.hermes.maxWallHours}h`,
+    );
+    // effectiveMs should equal capMs (no clamping since user didn't ask
+    // for anything longer than the cap)
+    const capMs = config.hermes.maxWallHours * 60 * 60 * 1000;
+    expect(after.timer!.effectiveMs).toBe(capMs);
+    expect(after.timer!.clamped).toBe(false);
+  });
+
+  // I-7: reply message contains "resuming orchestrator" hint
+  test("I-7: reply message contains 'resuming orchestrator' when project is terminal", async () => {
+    expect(state.status).toBe("killed");
+    const { msg, replies } = newFakeMessage();
+
+    await handleProjectSetMode(msg, state.threadId, "auto");
+
+    expect(replies).toHaveLength(1);
+    expect(replies[0]).toContain("resuming orchestrator");
+    // And does NOT contain the "will plan tasks" non-terminal phrasing
+    expect(replies[0]).not.toContain("Hermes will plan tasks,");
+  });
+
+  // Bonus: a setMode auto on an active project should reply with the
+  // non-terminal phrasing ("Hermes will plan tasks...") and NOT mention
+  // "resuming orchestrator". Pins the message branch.
+  test("I-7 (active): reply uses 'will plan tasks' phrasing, not 'resuming orchestrator'", async () => {
+    const active = makeProject({
+      status: "executing",
+      mode: "auto",
+      endedAt: null,
+      killedReason: undefined,
+    });
+    ensureProjectDir(hermesDir, active.id);
+    saveState(hermesDir, active.id, active);
+
+    const { msg, replies } = newFakeMessage();
+    await handleProjectSetMode(msg, active.threadId, "auto");
+
+    expect(replies).toHaveLength(1);
+    expect(replies[0]).toContain("Hermes will plan tasks,");
+    expect(replies[0]).not.toContain("resuming orchestrator");
+  });
+
+  // Sanity: with a duration arg, the requested duration is honored
+  test("setMode auto with explicit duration uses that duration (not the cap)", async () => {
+    const { msg } = newFakeMessage();
+
+    await handleProjectSetMode(msg, state.threadId, "auto", "30m");
+
+    const after = loadState(hermesDir, state.id)!;
+    expect(after.timer).toBeDefined();
+    expect(after.timer!.requestedDuration).toBe("30m");
+    expect(after.timer!.effectiveMs).toBe(30 * 60 * 1000);
+    expect(after.timer!.clamped).toBe(false);
   });
 });

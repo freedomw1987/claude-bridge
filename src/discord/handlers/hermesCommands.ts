@@ -601,9 +601,10 @@ export async function handleProjectResume(
  *   switches mode for a terminal one.
  * - `setMode auto [duration]`: arms a wallclock timer. If the project is
  *   already active (planning/executing/judging), the new timer replaces
- *   any existing one. If terminal, this is a no-op for the running loop
- *   but the next /project resume will pick up the timer (or skip it if
- *   /project resume's contract is "fresh window" — see M2.7).
+ *   any existing one. If the project is terminal (killed/failed/done,
+ *   e.g. from a prior manual switch that ran softExit), the orchestrator
+ *   is automatically resumed so the user doesn't have to also type
+ *   `/project resume` — see RG-006.
  * - Duration defaults to HERMES_MAX_WALL_HOURS (the safety cap).
  *   The user-set value is clamped to the cap; we surface a "Capped at X"
  *   message when clamping occurs.
@@ -613,6 +614,7 @@ export async function handleProjectSetMode(
   threadId: string,
   mode: "auto" | "manual",
   durationRaw?: string,
+  store?: SessionStore,
 ): Promise<void> {
   const hermesDir = resolveHermesDir(config.paths.dataDir, config.paths.hermesDir);
   const state = findProjectByThread(hermesDir, threadId);
@@ -748,16 +750,68 @@ export async function handleProjectSetMode(
   const capNote = clamped
     ? ` (capped at ${config.hermes.maxWallHours}h — the safety cap)`
     : "";
+  // RG-006: if the project is terminal, the message hints that Hermes
+  // is automatically resuming — otherwise it just arms the timer.
+  const willResume = !isActive(state);
   await msg.reply(
     `🔧 Project mode → \`auto\`, timer = \`${state.timer.requestedDuration}\`${capNote}. ` +
-      `Hermes will plan tasks, drive Claude Code through each one, and self-assess completion.`,
+      (willResume
+        ? `Hermes was idle; resuming orchestrator now — it will plan remaining tasks and drive Claude Code through them.`
+        : `Hermes will plan tasks, drive Claude Code through each one, and self-assess completion.`),
   );
   log.info("hermes: project mode changed to auto", {
     projectId: state.id,
     duration: state.timer.requestedDuration,
     effectiveMs: state.timer.effectiveMs,
     clamped,
+    autoResumed: willResume,
   });
+
+  // RG-006: auto-resume the orchestrator if the project is currently
+  // terminal (killed/failed/done). Before this fix, `/project setMode auto`
+  // only flipped state.mode + armed the timer but never restarted the
+  // orchestrator loop, so the user had to also type `/project resume` —
+  // a UX gap surfaced on 2026-06-22 by David. Now setMode auto on a
+  // terminal project transparently resumes, matching the natural mental
+  // model ("switch back to auto → Hermes takes over again").
+  //
+  // For active projects (planning/executing/judging) the orchestrator
+  // loop is already running, so we don't restart — restarting would
+  // spawn a second loop and race against the existing one.
+  if (!isActive(state)) {
+    // Capture the pre-resume status for the journal entry BEFORE we
+    // mutate it — otherwise the audit log loses the "from" status.
+    const fromStatus = state.status;
+    // Reset to executing; orchestrator will pick up where it left off.
+    state.status = "executing";
+    state.endedAt = null;
+    saveState(hermesDir, state.id, state);
+    appendJournal(hermesDir, state.id, {
+      type: "status",
+      message: `auto-resumed by /project setMode auto (was ${fromStatus})`,
+    });
+    // `store` is optional for testability (some test fixtures pass a
+    // mock store) but in production it's always provided by
+    // dispatchHermesCommand. Fall back to a no-claudeSession lookup if
+    // it's missing rather than crashing — the orchestrator will then
+    // start a fresh CC session instead of resuming one.
+    const session = store?.get(threadId);
+    runProject(state.id, {
+      hermesDir,
+      thread: msg.channel as ThreadChannel,
+      claudeSession: session?.claudeSession ?? null,
+      userMsgStub: msg,
+    }).catch((err) => {
+      log.error("hermes: setMode auto resume crashed", {
+        projectId: state.id,
+        err: String(err),
+      });
+    });
+    log.info("hermes: setMode auto triggered auto-resume", {
+      projectId: state.id,
+      fromStatus: state.status,
+    });
+  }
 }
 
 // ── Top-level dispatcher ──────────────────────────────────────────────
@@ -831,6 +885,7 @@ export async function dispatchHermesCommand(
       threadId,
       setModeMatch.mode,
       setModeMatch.duration,
+      ctx.store,
     );
     return true;
   }
