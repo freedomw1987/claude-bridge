@@ -42,27 +42,24 @@ export function makeHermesSend(thread: ThreadChannel) {
   };
 }
 
+/**
+ * Hermes metadata is condensed into single-line summaries so Claude Code's
+ * engineering output stays the visual focus in the thread (UX-3). Each
+ * helper returns ONE line that fits well under the Hermes prefix. Verdict
+ * reasoning is intentionally truncated — full text is on disk in state.json
+ * for `/project status` and audit.
+ */
+
 export function formatPlanMessage(state: ProjectState): string {
-  const lines: string[] = [];
-  lines.push(`📋 **Plan ready** — ${state.plan.length} tasks for: *${state.goal}*`);
-  lines.push("");
-  for (const t of state.plan) {
-    const deps = t.dependsOn.length > 0 ? ` _(after ${t.dependsOn.join(", ")})_` : "";
-    lines.push(`- **${t.id}** ${t.title}${deps}`);
-  }
-  lines.push("");
-  lines.push(`⏳ Starting execution (mode=${state.mode}, budget=$${(state.config.maxCostUsd / 100).toFixed(2)}, max iters=${state.config.maxIterations})...`);
-  return lines.join("\n");
+  const budget = `$${(state.config.maxCostUsd / 100).toFixed(2)}`;
+  return `📋 Plan: ${state.plan.length} tasks (mode=${state.mode}, budget=${budget}, max iters=${state.config.maxIterations}) → starting execution`;
 }
 
 export function formatTaskStart(state: ProjectState, task: Task): string {
   const idx = state.plan.indexOf(task) + 1;
   const total = state.plan.length;
-  return [
-    `▶️ **Task ${idx}/${total}: ${task.id}** ${task.title}` +
-      (task.attempts > 1 ? ` (attempt ${task.attempts})` : ""),
-    `> ${task.description}`,
-  ].join("\n");
+  const attempt = task.attempts > 1 ? ` attempt ${task.attempts}` : "";
+  return `▶️ ${idx}/${total} ${task.id}${attempt}`;
 }
 
 export function formatTaskDone(
@@ -72,10 +69,9 @@ export function formatTaskDone(
 ): string {
   const done = state.plan.filter((t) => t.status === "done").length;
   const total = state.plan.length;
-  return [
-    `✅ **${task.id} done** in ${formatDuration(details.durationMs)} ($${(details.costUsd / 100).toFixed(2)})`,
-    `Progress: ${done}/${total} (${Math.round((done / total) * 100)}%) | Total $${(state.costUsd / 100).toFixed(2)} | ${state.iterations} iter`,
-  ].join("\n");
+  const cost = `$${(details.costUsd / 100).toFixed(2)}`;
+  const totalCost = `$${(state.costUsd / 100).toFixed(2)}`;
+  return `✅ ${task.id} ${formatDuration(details.durationMs)} ${cost} (${done}/${total} • ${totalCost} • ${state.iterations} iter)`;
 }
 
 export function formatTaskFail(
@@ -83,12 +79,15 @@ export function formatTaskFail(
   error: string,
   willRetry: boolean,
 ): string {
-  return [
-    `❌ **${task.id} failed** (attempt ${task.attempts})`,
-    `> ${error.slice(0, 300)}`,
-    willRetry ? `⏳ Will retry...` : `🚫 No more retries; escalating.`,
-  ].join("\n");
+  const tail = willRetry ? "retrying" : "escalating";
+  const errShort = truncateInline(error, 80);
+  return `❌ ${task.id} attempt ${task.attempts}: ${errShort} → ${tail}`;
 }
+
+// Note: formatTaskFail intentionally omits state — the per-task error
+// is self-contained and the single-line format doesn't need aggregate
+// progress. Keep state out of the signature so the caller can't
+// accidentally inflate the format back to multi-line.
 
 export function formatCompletion(state: ProjectState): string {
   const elapsed = state.endedAt
@@ -98,24 +97,27 @@ export function formatCompletion(state: ProjectState): string {
       )
     : 0;
   const done = state.plan.filter((t) => t.status === "done").length;
-  return [
-    `🎉 **Project complete** in ${elapsed} min, $${(state.costUsd / 100).toFixed(2)} spent.`,
-    `Tasks: ${done}/${state.plan.length} done, ${state.iterations} total iterations.`,
-    ``,
-    `Verdict: ${state.lastVerdict?.reasoning ?? "(no verdict recorded)"}`,
-    ``,
-    `📂 Workspace: \`${state.repoPath}\``,
-  ].join("\n");
+  const totalCost = `$${(state.costUsd / 100).toFixed(2)}`;
+  const verdict = truncateInline(state.lastVerdict?.reasoning ?? "", 100);
+  return `🎉 done ${done}/${state.plan.length} ${elapsed}m ${totalCost} • ${state.iterations} iter • ${verdict}`;
 }
 
 export function formatEscalation(state: ProjectState, reason: string): string {
-  return [
-    `⚠️ **Project escalated to David**`,
-    `Reason: ${reason}`,
-    ``,
-    `Reply in this thread to give direction, or send \`/project kill\` to stop.`,
-    `Workspace: \`${state.repoPath}\``,
-  ].join("\n");
+  // state kept in signature for symmetry with formatCompletion; future
+  // expansion (e.g. showing iteration count in escalation) may use it.
+  void state;
+  return `⚠️ escalated: ${truncateInline(reason, 120)} — reply or \`/project kill\``;
+}
+
+/**
+ * Inline truncation: collapse multi-line error strings into a single line
+ * with whitespace collapsed, capped at max chars. Keeps the single-line
+ * format promise for collapsed Hermes metadata.
+ */
+function truncateInline(s: string, max: number): string {
+  const collapsed = s.replace(/\s+/g, " ").trim();
+  if (collapsed.length <= max) return collapsed;
+  return collapsed.slice(0, max - 1) + "…";
 }
 
 /**
@@ -144,19 +146,15 @@ export function formatStatusEmbed(state: ProjectState): string {
     (Date.now() - new Date(state.startedAt).getTime()) / 60000,
   );
   const timerLine = formatTimerLine(state);
-  const lines: string[] = [
-    `📊 **Project status: ${state.id.slice(0, 8)}**`,
-    `Status: \`${state.status}\` | Mode: \`${state.mode}\``,
+  const cost = `$${(state.costUsd / 100).toFixed(2)}`;
+  const budget = `$${(state.config.maxCostUsd / 100).toFixed(2)}`;
+  const parts = [
+    `📊 status=${state.status} mode=${state.mode}`,
+    `tasks: ${done}✓ ${inProg}▶ ${pending}… ${failed}✗ / ${state.plan.length}`,
+    `cost: ${cost}/${budget} • iter: ${state.iterations}/${state.config.maxIterations} • ${elapsed}m/${state.config.maxWallHours}h`,
   ];
-  if (timerLine) {
-    lines.push(timerLine);
-  }
-  lines.push(
-    `Tasks: ${done} done, ${inProg} in progress, ${pending} pending, ${failed} failed (${state.plan.length} total)`,
-    `Cost: $${(state.costUsd / 100).toFixed(2)} / $${(state.config.maxCostUsd / 100).toFixed(2)} | Iterations: ${state.iterations} / ${state.config.maxIterations} | Elapsed: ${elapsed} min / ${state.config.maxWallHours}h`,
-    `Workspace: \`${state.repoPath}\``,
-  );
-  return lines.join("\n");
+  if (timerLine) parts.push(timerLine);
+  return parts.join("\n");
 }
 
 function formatDuration(ms: number): string {
@@ -180,12 +178,5 @@ export function formatTimerExpired(state: ProjectState): string {
       )
     : 0;
   const done = state.plan.filter((t) => t.status === "done").length;
-  return [
-    `${HERMES_PREFIX} ⏱ **Auto-mode duration elapsed** — project stopped at next judge pass.`,
-    ``,
-    `Tasks completed: ${done}/${state.plan.length}. Elapsed: ${elapsed} min.`,
-    ``,
-    `Use \`/project resume\` to continue (without the old timer), or \`/project setMode auto <duration>\` to start a fresh window.`,
-    `Workspace: \`${state.repoPath}\``,
-  ].join("\n");
+  return `⏱ duration elapsed — stopped at judge pass (${done}/${state.plan.length} done, ${elapsed}m). Use \`/project resume\` or \`/project setMode auto <dur>\` to continue`;
 }

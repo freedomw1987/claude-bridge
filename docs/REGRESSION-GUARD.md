@@ -135,3 +135,98 @@
 - Original symptom: 2026-06-21T19:03:52 Discord thread(`<ant_thinking>...</ant_thinking>` leak)
 - 2026-06-22T02:44:45 Discord thread(`contentLength: 2102` → max-length fail → retry stripped to 783)
 - Both reproducible by `bun test src/discord/handlers/format.test.ts` "matches the actual log line" case
+
+
+## RG-003 — Hermes metadata collapse + Claude Code reply prefix (UX-3)
+
+### Problem
+- Discord thread 內嘅 Hermes orchestrator metadata(`📋 Plan ready`、`✅ task 1 done (30s, $0.12)`)佔據大量 visual space,**蓋過 Claude Code 嘅實際 engineering output**(edit / test / build)
+- Hermes 嘅 multi-line 格式 (`- **task-id** title`、`⏳ Starting execution...`)spam thread,用戶睇唔到 CC 喺做咩
+- **尤其喺 auto → manual mode 切換期間**:David 用 `/project setMode manual` 接管,需要睇返 CC 之前嘅 output 做 context — 但舊格式 Hermes metadata 同 CC reply 視覺上完全混合,**David 唔知邊段係 CC、邊段係 Hermes**
+
+### Symptom (what David saw before fix)
+```
+[Hermes] 🪪 Hermes: 📋 **Plan ready** — 5 tasks for: *fix auth bug*
+[Hermes] 🪪 Hermes:
+[Hermes] 🪪 Hermes: - **auth-fix** Fix authentication bug _(after setup)_
+[Hermes] 🪪 Hermes: - **login-page** Add login UI _(after auth-fix)_
+[Hermes] 🪪 Hermes: - **rate-limit** Add rate limiting _(after auth-fix)_
+[Hermes] 🪪 Hermes: - **tests** Write tests _(after auth-fix, login-page)_
+[Hermes] 🪪 Hermes: - **docs** Update docs _(after tests)_
+[Hermes] 🪪 Hermes:
+[Hermes] 🪪 Hermes: ⏳ Starting execution (mode=auto, budget=$5.00, max iters=20)...
+[CC] I'll fix the authentication bug. Starting by reading the auth module.
+[CC] Done. Added the missing check.
+[Hermes] 🪪 Hermes: ✅ **auth-fix done** in 30.0s ($0.12)
+[Hermes] 🪪 Hermes: Progress: 1/5 (20%) | Total $0.12 | 1 iter
+[Hermes] 🪪 Hermes: ▶️ **Task 2/5: login-page** Add login UI
+[Hermes] 🪪 Hermes: > Build the React login form component
+```
+
+User impression: "Hermes 講咗好多 metadata,CC 嘅實際工作 output 好細聲"
+
+### Root Cause (why it broke)
+1. `src/hermes/discord.ts` 嘅 `formatPlanMessage` / `formatTaskStart` / `formatTaskDone` / `formatTaskFail` / `formatCompletion` / `formatEscalation` / `formatStatusEmbed` / `formatTimerExpired` 全部用 multi-line format with headers (`**Plan ready**`)、blank lines、`> description` blockquotes — 一個 event 4-8 行
+2. CC 嘅 reply 經 `discord_send` tool(`sdkRunner.ts`)或 CLI streaming (`streaming.ts`) 直接 `thread.send(content)` — **冇任何 sender prefix**,user 無從分辨 Hermes vs CC
+3. 尤其 `formatStatusEmbed` 仲塞 `Workspace: \`/path\``、`Status: \`active\` | Mode: \`auto\`` 嘅 verbose label
+
+### Fix
+1. **`makeClaudeSend(thread, queue?)`** 喺 `src/discord/handlers/streaming.ts` 新增 — 包 `thread.send`,prefix `"🤖 **Claude Code:"` 喺 first chunk,continuation chunk bare(因為 Discord 視覺上 burst 一齊出)
+2. **Hermes formatter 全部 collapse 去單行**:
+   - `formatPlanMessage`: `📋 Plan: 5 tasks (mode=auto, budget=$5.00, max iters=20) → starting execution`
+   - `formatTaskStart`: `▶️ 1/5 auth-fix [attempt 2]`
+   - `formatTaskDone`: `✅ auth-fix 30.0s $0.12 (1/5 • $0.12 • 1 iter)`
+   - `formatTaskFail`: `❌ auth-fix attempt 1: <error short> → retrying|escalating`
+   - `formatCompletion`: `🎉 done 4/5 30m $0.42 • 1 iter • <verdict short>`
+   - `formatEscalation`: `⚠️ escalated: <reason short> — reply or \`/project kill\``
+   - `formatStatusEmbed`: 3 行(`📊 status=... mode=...` / `tasks: ...` / `cost: ... • iter: ... • ...`) + optional `⏱ Timer:` line
+   - `formatTimerExpired`: `⏱ duration elapsed — stopped at judge pass (...)`
+3. **`truncateInline()`** helper 處理 multi-line error 字串 → single-line collapse
+4. **Wire-up**:
+   - `runViaSdkWrapper` 用 `makeClaudeSend(thread, queue)` 取代 raw `queue.send(thread.send, content)`
+   - `runViaClaudeCli` 一樣
+   - Placeholder 用 raw queue send(冇 prefix),edit in place 維持 header line 簡潔
+
+### Invariants (必須一齊保持)
+
+| # | Invariant | Lock test |
+|---|-----------|-----------|
+| I-1 | `CLAUDE_PREFIX === "🤖 **Claude Code:**"` (不變) | `streaming.test.ts` "CLAUDE_PREFIX is stable" |
+| I-2 | `makeClaudeSend` 對 short reply 加 prefix 喺 first message | `streaming.test.ts` "short single reply" |
+| I-3 | `makeClaudeSend` 對 long reply split chunks,prefix 只喺 first chunk | `streaming.test.ts` "long reply that exceeds Discord limit" |
+| I-4 | `makeClaudeSend` 對 empty content throws(防止 silent message loss) | `streaming.test.ts` "empty content throws" |
+| I-5 | `makeClaudeSend` 接受 SendQueue,所有 send 都行經 queue | `streaming.test.ts` "with a SendQueue" |
+| I-6 | `formatStatusEmbed` 冇 timer 時係 3 行,有 timer 時 4 行 | `discord.test.ts` "renders compact 3-line status" + "appends timer line as 4th line" |
+| I-7 | 所有 Hermes formatter (`formatPlanMessage` / `formatTaskStart` / `formatTaskDone` / `formatTaskFail` / `formatCompletion` / `formatEscalation` / `formatStatusEmbed` / `formatTimerExpired`) output 唔包含 `\n` (single-line guarantee) | grep test for `\n` in output (manual review) |
+| I-8 | `formatTimerExpired` 仍然包括 `duration elapsed` 短語(REGRESSION-GUARD RG-002 softExit test pin) | `orchestrator.test.ts` "softExit (M2.4)" |
+| I-9 | `runViaSdkWrapper` 同 `runViaClaudeCli` 兩條 path 都 call `makeClaudeSend`,prefix wiring 一致 | grep `streaming.ts` for `makeClaudeSend` import + call sites (≥ 2) |
+| I-10 | Placeholder (`⏳ Working...` / `⏳ Running Claude Code...`) 用 raw queue send 唔加 prefix,edit 嘅 header line 唔會重覆 prefix | grep `streaming.ts` line 152 / 268 region — verify raw `queue.send` call |
+
+### 防止再發 (防護措施)
+- [x] **`makeClaudeSend` wrapper** centralizes prefix logic — 唔可以喺 runner path 直接 `thread.send` (要 grep 過 `streaming.ts` 確認冇 raw `thread.send` 直接 call 用作 CC reply)
+- [x] **Single-line Hermes formatters** — multi-line 格式係 silent footgun,新 contributor 可能 refactor 返 multi-line
+- [x] **`truncateInline()` helper** 用 regex collapse multi-line 內容 → single-line,防止 overflow
+- [x] **5 unit tests** for `makeClaudeSend` (prefix, chunking, empty, queue, stability)
+- [x] **2 unit tests** for `formatStatusEmbed` collapse (3-line + 4-line)
+- [x] **Update 2 existing tests** for `formatTimerExpired` 新 phrase (`duration elapsed` 取代 `Auto-mode duration elapsed`)
+- [x] **All 328 tests pass** + typecheck clean
+
+### Refactor Guard
+任何涉及以下文件嘅 refactor 必須:
+1. 跑 `bun test src/discord/handlers/streaming.test.ts` 並確認 5 個 `makeClaudeSend` test 全部 PASS
+2. 跑 `bun test src/hermes/discord.test.ts` 確認 8 個 `formatStatusEmbed` test 全部 PASS
+3. 跑 `bun test src/hermes/orchestrator.test.ts` 確認 2 個 `formatTimerExpired` softExit test PASS
+4. 對住 invariant table I-1..I-10 逐個 check 冇違反
+5. 改 Hermes formatter 嘅 output format 必須 keep single-line guarantee — multi-line 必須要 justification 加返(例如 spec change)
+6. 改 `makeClaudeSend` 簽名必須 update 兩個 caller (`runViaSdkWrapper` 同 `runViaClaudeCli`)
+
+### Detection signal (出現以下即 UX-3 走樣)
+- 任何 Hermes 訊息 > 2 行(可能有 contributor 加返 multi-line)
+- 任何 CC reply 冇 `🤖 **Claude Code:**` prefix
+- Discord thread 入面見到 `📋 **Plan ready**` 或 `✅ **task-id done**` 嘅舊格式 phrase
+- User report「睇唔到 Claude 喺做咩」或「Hermes 訊息太多」
+
+### 相關 Discussion
+- Original symptom: 2026-06-22 David 講「感覺到在開發」 → Hermes metadata 蓋過 CC output
+- 2026-06-22 跟進:David 講「setMode manual 中途用戶接管,thread 要有 cc 嘅內容,先可以人去接管」 → auto→manual handover 視覺斷裂
+- Decision log: `docs/MILESTONES.md` (待補 entry)

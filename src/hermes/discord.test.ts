@@ -1,12 +1,14 @@
 /**
- * Tests for the `formatStatusEmbed` timer line (M2.8 / ADR-0004).
+ * Tests for the `formatStatusEmbed` timer line (M2.8 / ADR-0004) plus
+ * the UX-3 collapse: Hermes metadata is condensed into single-line
+ * summaries so Claude Code's engineering output stays the visual focus.
  *
  * The status embed should:
+ * - Render a compact 3-line status (status/mode, tasks, cost/iters/elapsed)
  * - Omit the timer line when state.timer is undefined
- * - Render `⏱ Timer: M:SS remaining (auto, <duration>)` when expiresAt > now
- * - Render `⏱ Timer: expired (will stop at next judge pass)` when
+ * - Append `⏱ Timer: M:SS remaining (auto, <duration>)` when expiresAt > now
+ * - Append `⏱ Timer: expired (will stop at next judge pass)` when
  *   expiresAt <= now (the soft-exit boundary has not yet fired)
- * - Place the timer line between the header and the task summary
  *
  * We don't mock Date.now() — we use real `Date.now()` deltas with
  * generous margins so the tests aren't flaky under load.
@@ -45,7 +47,7 @@ function withTimer(state: ProjectState, expiresAt: number, requestedDuration = "
   return { ...state, timer };
 }
 
-describe("formatStatusEmbed — timer line (M2.8)", () => {
+describe("formatStatusEmbed — timer line (M2.8) + UX-3 collapse", () => {
   test("omits timer line when state.timer is undefined", () => {
     const state = baseState();
     expect(state.timer).toBeUndefined();
@@ -80,17 +82,22 @@ describe("formatStatusEmbed — timer line (M2.8)", () => {
     expect(out).not.toContain("remaining");
   });
 
-  test("places timer line between header and task summary", () => {
-    const state = withTimer(baseState(), Date.now() + 15 * 60 * 1000);
+  test("renders compact 3-line status without timer", () => {
+    const out = formatStatusEmbed(baseState());
+    // UX-3: collapse to 3 lines (status/mode, tasks, cost/iters/elapsed).
+    const lines = out.split("\n");
+    expect(lines.length).toBe(3);
+    expect(lines[0]).toMatch(/^📊 status=\w+ mode=auto$/);
+    expect(lines[1]).toMatch(/^tasks: 0✓ 0▶ 0… 0✗ \/ 0$/);
+    expect(lines[2]).toMatch(/^cost: \$0\.00\/\$5\.00 • iter: 0\/20 • 0m\/4h$/);
+  });
+
+  test("appends timer line as 4th line when timer active", () => {
+    const state = withTimer(baseState(), Date.now() + 30 * 60 * 1000, "30m");
     const out = formatStatusEmbed(state);
-    const headerIdx = out.indexOf("Project status");
-    const statusIdx = out.indexOf("Status:");
-    const timerIdx = out.indexOf("⏱ Timer:");
-    const tasksIdx = out.indexOf("Tasks:");
-    expect(headerIdx).toBeGreaterThanOrEqual(0);
-    expect(statusIdx).toBeGreaterThan(headerIdx);
-    expect(timerIdx).toBeGreaterThan(statusIdx);
-    expect(tasksIdx).toBeGreaterThan(timerIdx);
+    const lines = out.split("\n");
+    expect(lines.length).toBe(4);
+    expect(lines[3]).toMatch(/^⏱ Timer: 30:00 remaining \(auto, 30m\)$/);
   });
 
   test("uses state.mode in the timer label (e.g. 'manual' with timer is rendered as 'manual')", () => {

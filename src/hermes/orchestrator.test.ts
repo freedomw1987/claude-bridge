@@ -356,7 +356,7 @@ describe("softExit (M2.4)", () => {
     expect(out.endedAt).toBeDefined();
     expect(out.timer).toBeUndefined();
     expect(thread.sent.length).toBe(1);
-    expect(thread.sent[0]).toContain("Auto-mode duration elapsed");
+    expect(thread.sent[0]).toContain("duration elapsed");
   });
 
   test("manual_switch reason posts a different message", async () => {
@@ -661,7 +661,7 @@ describe("E2E M2.11 — timer fires → softExit (duration_expired)", () => {
 
       // 6. Verify Discord got exactly one message.
       expect(thread.sent.length).toBe(1);
-      expect(thread.sent[0]).toContain("Auto-mode duration elapsed");
+      expect(thread.sent[0]).toContain("duration elapsed");
       expect(thread.sent[0]).toContain("⏱");
 
       // 7. Cleanup the arm handle (defensive; the callback already ran).

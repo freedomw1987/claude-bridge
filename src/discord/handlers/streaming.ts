@@ -30,6 +30,56 @@ import { splitForDiscord, DISCORD_MAX } from "../split";
 import { SendQueue } from "../sendQueue";
 import { truncate, stripThinkTags, containsQuestion, formatToolUse, TOOL_ICON } from "./format";
 
+/**
+ * Prefix applied to every Claude Code reply posted to a thread (UX-3).
+ * Lets David visually distinguish Hermes orchestrator metadata
+ * ("🪪 Hermes:") from CC's actual engineering output.
+ */
+export const CLAUDE_PREFIX = "🤖 **Claude Code:**";
+
+/**
+ * Build a Discord-send function that prefixes every message with
+ * `CLAUDE_PREFIX`. Used by both the CLI and SDK runner paths so that
+ * `discord_send` tool calls and streamed text are visually tagged the
+ * same way.
+ *
+ * Pass `queue` to throttle multi-chunk sends (when content exceeds
+ * Discord's 2000-char limit and we split into multiple messages). The
+ * runner paths already have a `SendQueue` for `discord_send` calls, so
+ * they pass it in here. Without a queue, sends fire synchronously
+ * (acceptable for short single-message replies).
+ *
+ * Returns the FIRST Message (Discord's reply object) — `discordSendTool`
+ * needs the message ID for its return value. Continuation chunks are
+ * posted as separate messages but their IDs are discarded.
+ *
+ * Assumes content is already cleaned of `<ant_thinking>` etc by
+ * upstream tool wrappers (see RG-002 in REGRESSION-GUARD.md).
+ */
+export function makeClaudeSend(
+  thread: ThreadChannel,
+  queue?: SendQueue,
+): (content: string) => Promise<Message> {
+  const post = (text: string): Promise<Message> =>
+    queue
+      ? queue.send<Message>((c) => thread.send(c), text)
+      : thread.send(text);
+  return async (content: string): Promise<Message> => {
+    if (!content) {
+      // Should not happen — callers must check empty before calling —
+      // but guard anyway so we never return a fake Message.
+      throw new Error("makeClaudeSend: empty content");
+    }
+    const budget = DISCORD_MAX - CLAUDE_PREFIX.length - 1;
+    const bodyChunks = splitForDiscord(content, budget);
+    const first = await post(`${CLAUDE_PREFIX} ${bodyChunks[0]}`);
+    for (let i = 1; i < bodyChunks.length; i++) {
+      await post(bodyChunks[i]);
+    }
+    return first;
+  };
+}
+
 // ---- Discord helpers ----
 
 /**
@@ -145,11 +195,21 @@ async function runViaSdkWrapper(
   // `discord_send` calls in a burst (typing refresh, final summary,
   // multi-message answer) and we want to stay under Discord's per-channel
   // 5 msg / 5 s limit. The queue is fresh per Discord run.
+  //
+  // UX-3: wrap with makeClaudeSend so every discord_send call (and every
+  // continuation chunk) carries the "🤖 Claude Code:" prefix. This makes
+  // Hermes metadata ("🪪 Hermes:") vs CC engineering output visually
+  // distinct — critical for auto→manual mode transitions where David
+  // needs to see CC's prior work to take over.
   const queue = new SendQueue();
-  const send = (content: string): Promise<Message> =>
-    queue.send<Message>((c) => thread.send(c), content);
-
-  const placeholder = await send("⏳ Working...");
+  // Placeholder: raw queue send (no CLAUDE prefix) so the final edited
+  // header doesn't accidentally carry both the placeholder prefix and
+  // the "🧠 Claude" summary line.
+  const placeholder = await queue.send<Message>(
+    (c) => thread.send(c),
+    "⏳ Working...",
+  );
+  const send = makeClaudeSend(thread, queue);
   const stopTyping = startTypingIndicator(thread);
 
   let result;
@@ -261,11 +321,19 @@ async function runViaClaudeCli(
   // Discord's per-channel limit is ~5 msg / 5s; bursty flushStream +
   // final-summary posts can blow past that. The queue spaces sends out
   // (~1.1s apart) while keeping the first send immediate.
+  //
+  // UX-3: wrap with makeClaudeSend so streamed text chunks and the
+  // final summary carry the "🤖 Claude Code:" prefix (CLI path). The
+  // placeholder stays raw — we edit it in place with the header line
+  // after the run finishes.
   const queue = new SendQueue();
-  const send = (content: string): Promise<Message> =>
-    queue.send<Message>((c) => thread.send(c), content);
-
-  const placeholder = await send("⏳ Running Claude Code...");
+  // Placeholder: raw queue send (no CLAUDE prefix) — edited in place
+  // to the summary header at the end.
+  const placeholder = await queue.send<Message>(
+    (c) => thread.send(c),
+    "⏳ Running Claude Code...",
+  );
+  const send = makeClaudeSend(thread, queue);
 
   // Show typing indicator + react to user's message on completion
   const stopTyping = startTypingIndicator(thread);
