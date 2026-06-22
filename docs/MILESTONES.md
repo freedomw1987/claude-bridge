@@ -237,27 +237,35 @@ so David can give Hermes autonomous control of a project for a bounded
 window without babysitting.
 
 ### Tasks
-- [ ] M2.1: `src/hermes/duration.ts` — `parseDuration(s)` parser + tests
-- [ ] M2.2: `src/hermes/types.ts` — add `ProjectTimer` to `ProjectState`
-- [ ] M2.3: `src/hermes/state.ts` — persist `timer` (without `handle`) in
+- [x] M2.1: `src/hermes/duration.ts` — `parseDuration(s)` parser + tests
+- [x] M2.2: `src/hermes/types.ts` — add `ProjectTimer` to `ProjectState`
+- [x] M2.3: `src/hermes/state.ts` — persist `timer` (without `handle`) in
   `state.json`; hydrate on `loadState`
-- [ ] M2.4: `src/hermes/orchestrator.ts` — `softExit(projectId)` helper;
+- [x] M2.4: `src/hermes/orchestrator.ts` — `softExit(projectId)` helper;
   call at `judging → verdict` transition when `state.timer.expiresAt` past
-- [ ] M2.5: `src/index.ts` — `resumeActiveProjects` re-arms `setTimeout`
+- [x] M2.5: `src/index.ts` — `resumeActiveProjects` re-arms `setTimeout`
   from persisted `expiresAt`; auto-`softExit` if already past
-- [ ] M2.6: `hermesCommands.ts` — `matchSetMode` accepts optional duration;
+- [x] M2.6: `hermesCommands.ts` — `matchSetMode` accepts optional duration;
   `handleProjectSetMode` parses, clamps to cap, sets/clears timer
-- [ ] M2.7: `hermesCommands.ts` — relax `setMode auto` gate to allow
+- [x] M2.7: `hermesCommands.ts` — relax `setMode auto` gate to allow
   active projects (with timer); keep `setMode manual` cancel logic
-- [ ] M2.8: `src/hermes/discord.ts` — `formatStatusEmbed` adds
-  `timer: M:SS remaining` line when `state.timer` is set
-- [ ] M2.9: docs — `PRD.md` (F7), `ARCHITECTURE.md` (state-machine diagram
+  *(done implicitly in M2.6: new `handleProjectSetMode` uses
+  `isActive()` to branch between `softExit(..., 'manual_switch')` and
+  a plain mode flip, rather than rejecting active projects)*
+- [x] M2.8: `src/hermes/discord.ts` — `formatStatusEmbed` adds
+  `⏱ Timer: M:SS remaining (auto, <duration>)` line when `state.timer`
+  is set; renders `⏱ Timer: expired (will stop at next judge pass)`
+  when `expiresAt <= now` but the soft-exit boundary has not yet fired
+- [x] M2.9: docs — `PRD.md` (F7), `ARCHITECTURE.md` (state-machine diagram
   + duration_expired branch), `MILESTONES.md` (this entry), `taskboard.md`
-  (status section), ADR-0004 (already written)
-- [ ] M2.10: tests — `parseDuration` cases, timer set/clear, `softExit`
-  boundary check, bot-restart re-hydration
+  (status section), ADR-0004 (already written in `f04630f`)
+- [x] M2.10: tests — `parseDuration` cases, timer set/clear, `softExit`
+  boundary check, bot-restart re-hydration, status-embed timer line
+  *(301/301 passing, 1 skip, typecheck clean)*
 - [ ] M2.11: E2E manual smoke — `/project setMode auto 1m` then wait
   70s, observe `duration_expired` message at next judge pass
+  *(deferred — David runs manually; smoke-test script lives in
+  `scripts/smoke-m2.sh`)*
 
 ### Deliverable
 `/project setMode auto 30m` gives a 30-minute autonomous window. Status
