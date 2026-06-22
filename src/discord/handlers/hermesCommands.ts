@@ -40,13 +40,14 @@ import {
   type HermesRuntimeConfig,
   type ProjectMode,
 } from "../../hermes/types";
-import { runProject } from "../../hermes/orchestrator";
+import { armProjectTimer, runProject, softExit } from "../../hermes/orchestrator";
 import {
   formatPlanMessage,
   formatStatusEmbed,
   HERMES_PREFIX,
 } from "../../hermes/discord";
 import { abortSdkRun, isSdkRunActive } from "../../agent/sdkRunner";
+import { parseDuration } from "../../hermes/duration";
 import type { SessionStore } from "../../db";
 
 // ── Matchers ──────────────────────────────────────────────────────────
@@ -87,12 +88,43 @@ export const matchList = (content: string): boolean =>
  * Match `/project setMode auto|manual` or `/project setMode=auto|manual`.
  * Returns the mode value if matched, null otherwise.
  */
-export const matchSetMode = (content: string): "auto" | "manual" | null => {
-  const m = stripMention(content).match(/^\/project\s+setMode(?:\s+|=)(\w+)/i);
+/**
+ * Match `/project setMode auto|manual [duration]` or
+ * `/project setMode=auto|manual` (legacy form, no duration).
+ *
+ * Examples:
+ *   "/project setMode auto"        → { mode: "auto", duration: undefined }
+ *   "/project setMode auto 30m"    → { mode: "auto", duration: "30m" }
+ *   "/project setMode auto 1h30m"  → { mode: "auto", duration: "1h30m" }
+ *   "/project setMode manual"      → { mode: "manual", duration: undefined }
+ *   "/project setMode=auto 30m"    → { mode: "auto", duration: "30m" }
+ *   "/project setMode foo"         → null
+ *
+ * Duration is captured as a raw string; the caller (handleProjectSetMode)
+ * passes it to parseDuration(). We don't validate here so the parser
+ * error messages stay in one place.
+ */
+export const matchSetMode = (
+  content: string,
+): { mode: "auto" | "manual"; duration?: string } | null => {
+  // Capture the mode + optional duration. Duration is one or more
+  // "<digits><unit>" chunks separated by nothing (parser handles
+  // ordering). We capture the rest of the line so trailing tokens
+  // like "setMode auto 30m extra" are still parseable — handleProjectSetMode
+  // complains if there's any leftover after duration.
+  const m = stripMention(content).match(
+    /^\/project\s+setMode(?:\s+|=)(\w+)(?:\s+([\dhms]+))?(?:\s+(.*))?$/i,
+  );
   if (!m) return null;
-  const v = m[1].toLowerCase();
-  if (v === "auto" || v === "manual") return v;
-  return null;
+  const modeRaw = m[1].toLowerCase();
+  if (modeRaw !== "auto" && modeRaw !== "manual") return null;
+  const duration = m[2];
+  const leftover = m[3]?.trim();
+  // Reject trailing garbage so typos like "setMode auto 30m!" surface
+  // a clear error rather than silently being parsed.
+  if (leftover && leftover.length > 0) return null;
+  if (duration) return { mode: modeRaw, duration };
+  return { mode: modeRaw };
 };
 
 // ── Top-level handlers ────────────────────────────────────────────────
@@ -347,10 +379,27 @@ export async function handleProjectResume(
  * orchestrator pauses before each task and awaits the Chairman's reply
  * (go/skip/abort) before invoking Claude Code.
  */
+/**
+ * Handle `/project setMode auto [duration]` and `/project setMode manual`.
+ *
+ * ADR-0004 behavior:
+ * - `setMode manual`: cancels any active auto-mode timer and either
+ *   softExits an active project (killedReason="manual_switch") or just
+ *   switches mode for a terminal one.
+ * - `setMode auto [duration]`: arms a wallclock timer. If the project is
+ *   already active (planning/executing/judging), the new timer replaces
+ *   any existing one. If terminal, this is a no-op for the running loop
+ *   but the next /project resume will pick up the timer (or skip it if
+ *   /project resume's contract is "fresh window" — see M2.7).
+ * - Duration defaults to HERMES_MAX_WALL_HOURS (the safety cap).
+ *   The user-set value is clamped to the cap; we surface a "Capped at X"
+ *   message when clamping occurs.
+ */
 export async function handleProjectSetMode(
   msg: Message,
   threadId: string,
   mode: "auto" | "manual",
+  durationRaw?: string,
 ): Promise<void> {
   const hermesDir = resolveHermesDir(config.paths.dataDir, config.paths.hermesDir);
   const state = findProjectByThread(hermesDir, threadId);
@@ -358,35 +407,143 @@ export async function handleProjectSetMode(
     await msg.reply(`❌ No Hermes project in this thread.`);
     return;
   }
-  // Mode change is only meaningful for projects that haven't started
-  // running yet. For an active project, the dispatcher behavior is
-  // already wired (auto: orchestrated; manual: direct Claude Code run).
-  // Switching mid-run would leave the orchestrator's local state out of
-  // sync with disk. The user can /project kill and /project start again.
-  if (isActive(state)) {
+
+  // ── Parse + clamp duration (auto only) ──────────────────────────
+  let effectiveMs: number | null = null;
+  let requestedDuration: string | undefined = durationRaw;
+  let clamped = false;
+  if (mode === "auto") {
+    const capMs = config.hermes.maxWallHours * 60 * 60 * 1000;
+    if (durationRaw !== undefined) {
+      const parsed = parseDuration(durationRaw);
+      if (parsed === null) {
+        await msg.reply(
+          `❌ Cannot parse duration: \`${durationRaw}\`. Try "30m" / "2h" / "1d" / "1h30m".`,
+        );
+        return;
+      }
+      effectiveMs = parsed;
+    } else {
+      // Default to the safety cap
+      effectiveMs = capMs;
+      requestedDuration = `${config.hermes.maxWallHours}h (default)`;
+    }
+    if ((effectiveMs ?? 0) > capMs) {
+      effectiveMs = capMs;
+      clamped = true;
+    }
+  }
+
+  // ── Switch to manual ────────────────────────────────────────────
+  if (mode === "manual") {
+    // Always clear the existing timer (whether active or terminal).
+    const hadTimer = state.timer !== undefined;
+    if (state.timer?.handle) {
+      clearTimeout(state.timer.handle);
+    }
+    if (hadTimer) {
+      appendJournal(hermesDir, state.id, {
+        type: "timer",
+        message: "timer cancelled (manual switch)",
+      });
+    }
+    // If active, soft-exit so the orchestrator loop bails at the next
+    // judge pass. We pass the current state (post-clearTimer mutation
+    // is handled inside softExit).
+    if (isActive(state)) {
+      const activeState = state;
+      // softExit mutates and saves; we need to refresh our local state
+      // pointer to match.
+      const updated = await softExit(state.id, activeState, {
+        hermesDir,
+        thread: msg.channel as ThreadChannel,
+        claudeSession: null,
+      }, "manual_switch");
+      state.status = updated.status;
+      state.killedReason = updated.killedReason;
+      state.endedAt = updated.endedAt;
+      state.timer = updated.timer;
+    } else {
+      // Terminal — just record the mode flip.
+      state.mode = "manual";
+      saveState(hermesDir, state.id, state);
+      appendJournal(hermesDir, state.id, {
+        type: "status",
+        message: "mode changed → manual (terminal project)",
+      });
+    }
     await msg.reply(
-      `❌ Cannot change mode while project is \`${state.status}\`. Use \`/project kill\` first, then start a new project with the new mode.`,
+      `🔧 Project mode → \`manual\`. ${hadTimer ? "Auto-mode timer cancelled. " : ""}` +
+        `Goal will be passed directly to Claude Code as a single prompt (no planning, no per-task approval).`,
     );
+    log.info("hermes: project mode changed to manual", {
+      projectId: state.id,
+      hadTimer,
+    });
     return;
   }
-  if (state.mode === mode) {
-    await msg.reply(`Project is already in \`${mode}\` mode.`);
-    return;
+
+  // ── Switch to auto [duration] ───────────────────────────────────
+  if (state.mode === "auto" && state.timer) {
+    // Same mode + already has a timer → replace the timer.
+    if (state.timer.handle) {
+      clearTimeout(state.timer.handle);
+    }
+    appendJournal(hermesDir, state.id, {
+      type: "timer",
+      message: `timer replaced (was ${state.timer.requestedDuration})`,
+    });
   }
-  state.mode = mode;
+  // Persist the new timer BEFORE arming so a crash mid-arm doesn't leave
+  // a "set but not stored" state.
+  state.mode = "auto";
+  state.timer = {
+    expiresAt: Date.now() + (effectiveMs ?? config.hermes.maxWallHours * 60 * 60 * 1000),
+    requestedDuration: requestedDuration ?? `${config.hermes.maxWallHours}h (default)`,
+    effectiveMs: effectiveMs ?? config.hermes.maxWallHours * 60 * 60 * 1000,
+    clamped,
+    // handle set by armProjectTimer below
+  };
   saveState(hermesDir, state.id, state);
   appendJournal(hermesDir, state.id, {
     type: "status",
-    message: `mode changed → ${mode}`,
+    message: `mode changed → auto (timer=${state.timer.requestedDuration}${clamped ? ", clamped to " + config.hermes.maxWallHours + "h" : ""})`,
   });
-  const helpText =
-    mode === "manual"
-      ? "Goal will be passed directly to Claude Code as a single prompt (no planning, no per-task approval). Replies in this thread will be forwarded as follow-ups."
-      : "Hermes will plan tasks, drive Claude Code through each one, and self-assess completion.";
-  await msg.reply(`🔧 Project mode → \`${mode}\`. ${helpText}`);
-  log.info("hermes: project mode changed", {
+
+  // Arm a wallclock setTimeout. Only meaningful for active projects (a
+  // terminal project won't be running the orchestrator loop, so the
+  // timer just sits there until /project resume re-arms it). We still
+  // arm unconditionally so a fresh /project setMode auto on a terminal
+  // project has a "live" timer (will fire softExit on next /resume if
+  // it's still in the future at that point).
+  armProjectTimer(state, () => {
+    // Re-load state — closure capture may be stale.
+    const fresh = loadState(hermesDir, state.id);
+    if (!fresh || !isActive(fresh)) return;
+    softExit(state.id, fresh, {
+      hermesDir,
+      thread: msg.channel as ThreadChannel,
+      claudeSession: null,
+    }, "duration_expired").catch((err) => {
+      log.error("hermes: handleProjectSetMode timer softExit failed", {
+        projectId: state.id,
+        err: String(err),
+      });
+    });
+  });
+
+  const capNote = clamped
+    ? ` (capped at ${config.hermes.maxWallHours}h — the safety cap)`
+    : "";
+  await msg.reply(
+    `🔧 Project mode → \`auto\`, timer = \`${state.timer.requestedDuration}\`${capNote}. ` +
+      `Hermes will plan tasks, drive Claude Code through each one, and self-assess completion.`,
+  );
+  log.info("hermes: project mode changed to auto", {
     projectId: state.id,
-    mode,
+    duration: state.timer.requestedDuration,
+    effectiveMs: state.timer.effectiveMs,
+    clamped,
   });
 }
 
@@ -454,9 +611,14 @@ export async function dispatchHermesCommand(
     return true;
   }
 
-  const setMode = matchSetMode(trimmed);
-  if (setMode) {
-    await handleProjectSetMode(ctx.msg, threadId, setMode);
+  const setModeMatch = matchSetMode(trimmed);
+  if (setModeMatch) {
+    await handleProjectSetMode(
+      ctx.msg,
+      threadId,
+      setModeMatch.mode,
+      setModeMatch.duration,
+    );
     return true;
   }
 

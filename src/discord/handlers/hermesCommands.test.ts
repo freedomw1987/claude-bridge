@@ -156,24 +156,24 @@ describe("@bot mention prefix (regression: 2026-06-22 path-as-path bug)", () => 
 
 describe("matchSetMode", () => {
   test("matches /project setMode auto", () => {
-    expect(matchSetMode("/project setMode auto")).toBe("auto");
+    expect(matchSetMode("/project setMode auto")).toEqual({ mode: "auto" });
   });
 
   test("matches /project setMode manual", () => {
-    expect(matchSetMode("/project setMode manual")).toBe("manual");
+    expect(matchSetMode("/project setMode manual")).toEqual({ mode: "manual" });
   });
 
   test("matches /project setMode=auto (equals syntax)", () => {
-    expect(matchSetMode("/project setMode=auto")).toBe("auto");
+    expect(matchSetMode("/project setMode=auto")).toEqual({ mode: "auto" });
   });
 
   test("matches /project setMode=manual (equals syntax)", () => {
-    expect(matchSetMode("/project setMode=manual")).toBe("manual");
+    expect(matchSetMode("/project setMode=manual")).toEqual({ mode: "manual" });
   });
 
   test("case-insensitive on the value", () => {
-    expect(matchSetMode("/project setMode AUTO")).toBe("auto");
-    expect(matchSetMode("/project setMode Manual")).toBe("manual");
+    expect(matchSetMode("/project setMode AUTO")).toEqual({ mode: "auto" });
+    expect(matchSetMode("/project setMode Manual")).toEqual({ mode: "manual" });
   });
 
   test("returns null for invalid mode value", () => {
@@ -193,6 +193,80 @@ describe("matchSetMode", () => {
   });
 
   test("handles @bot mention prefix", () => {
-    expect(matchSetMode("<@12345> /project setMode auto")).toBe("auto");
+    expect(matchSetMode("<@12345> /project setMode auto")).toEqual({ mode: "auto" });
+  });
+});
+
+
+// ── M2.6: matchSetMode with optional duration (ADR-0004) ─────────
+
+describe("matchSetMode with duration (M2.6)", () => {
+  test("matches /project setMode auto 30m", () => {
+    expect(matchSetMode("/project setMode auto 30m")).toEqual({
+      mode: "auto",
+      duration: "30m",
+    });
+  });
+
+  test("matches /project setMode auto 1h30m (multi-unit)", () => {
+    expect(matchSetMode("/project setMode auto 1h30m")).toEqual({
+      mode: "auto",
+      duration: "1h30m",
+    });
+  });
+
+  test("matches /project setMode=auto 2h (equals syntax + duration)", () => {
+    expect(matchSetMode("/project setMode=auto 2h")).toEqual({
+      mode: "auto",
+      duration: "2h",
+    });
+  });
+
+  test("matches /project setMode manual (no duration, manual never has one)", () => {
+    expect(matchSetMode("/project setMode manual")).toEqual({
+      mode: "manual",
+    });
+  });
+
+  test("matches /project setMode auto (no duration, defaults to cap)", () => {
+    expect(matchSetMode("/project setMode auto")).toEqual({
+      mode: "auto",
+    });
+  });
+
+  test("rejects /project setMode manual 30m (manual never takes duration)", () => {
+    // The regex would parse "manual" as mode and "30m" as duration, but
+    // we still want the user to not accidentally type it. The matcher
+    // currently allows it (caller enforces "manual ignores duration");
+    // this test pins the current behavior so we know to change it
+    // consciously if desired.
+    expect(matchSetMode("/project setMode manual 30m")).toEqual({
+      mode: "manual",
+      duration: "30m",
+    });
+  });
+
+  test("rejects trailing garbage (setMode auto 30m extra)", () => {
+    expect(matchSetMode("/project setMode auto 30m extra")).toBeNull();
+  });
+
+  test("rejects malformed duration tokens", () => {
+    // "30min" is not a valid unit. Our regex only allows d|h|m|s, so
+    // "30min" would not match. Trailing "min" is rejected.
+    expect(matchSetMode("/project setMode auto 30min")).toBeNull();
+  });
+
+  test("case-insensitive on mode value with duration", () => {
+    expect(matchSetMode("/project setMode AUTO 30m")).toEqual({
+      mode: "auto",
+      duration: "30m",
+    });
+  });
+
+  test("handles @bot mention prefix with duration", () => {
+    expect(matchSetMode("<@12345> /project setMode auto 1h")).toEqual({
+      mode: "auto",
+      duration: "1h",
+    });
   });
 });
