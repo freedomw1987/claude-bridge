@@ -39,6 +39,7 @@ import {
   newProjectState,
   type HermesRuntimeConfig,
   type ProjectMode,
+  type ProjectState,
 } from "../../hermes/types";
 import { armProjectTimer, adoptProject, runProject, softExit } from "../../hermes/orchestrator";
 import {
@@ -48,6 +49,7 @@ import {
 } from "../../hermes/discord";
 import { abortSdkRun, isSdkRunActive } from "../../agent/sdkRunner";
 import { parseDuration } from "../../hermes/duration";
+import { resolveProjectRoot } from "../../hermes/projectIdentity";
 import type { SessionStore } from "../../db";
 
 // ── Matchers ──────────────────────────────────────────────────────────
@@ -244,12 +246,18 @@ export async function handleProjectStart(
   const hermesDir = resolveHermesDir(config.paths.dataDir, config.paths.hermesDir);
   ensureProjectDir(hermesDir, projectId);
 
+  // RG-007: capture the git toplevel as the project's identity key.
+  // If the path is not a git working tree, fall back to the absolute
+  // path (resolveProjectRoot handles the git failure gracefully).
+  const repoRoot = await resolveProjectRoot(repoPath);
+
   const state = newProjectState({
     id: projectId,
     threadId: thread.id,
     goal: parsed.goal,
     mode: parsed.flags.mode ?? "auto",
     repoPath,
+    repoRoot,
     repoSource,
     config: runtime,
   });
@@ -299,6 +307,39 @@ export async function handleProjectStart(
       err: String(err),
     });
   });
+}
+
+/**
+ * RG-007: scan all Hermes projects on disk and return the active ones
+ * whose `repoRoot` matches `repoRoot`. Used by `/project adopt` to
+ * find projects that need to be auto-killed before the new project
+ * is created. The match is exact-string equality — we do NOT do
+ * path-prefix matching here, because resolveProjectRoot already
+ * collapsed monorepo sub-folders to their git toplevel.
+ *
+ * Active = status ∈ {planning, executing, judging}. Killed / failed
+ * / done projects are NOT conflicts and are skipped (their state
+ * is preserved on disk for later `/project resume`).
+ *
+ * `excludeId` is defensive: the caller passes the not-yet-created
+ * `projectId` so we never accidentally collide with ourselves. In
+ * practice the new project isn't on disk at this point so this is
+ * belt-and-suspenders.
+ */
+async function findConflictingProjects(
+  hermesDir: string,
+  repoRoot: string,
+  excludeId: string,
+): Promise<ProjectState[]> {
+  const all = listProjects(hermesDir);
+  const conflicts: ProjectState[] = [];
+  for (const s of all) {
+    if (s.id === excludeId) continue;
+    if (!isActive(s)) continue;
+    if (s.repoRoot !== repoRoot) continue;
+    conflicts.push(s);
+  }
+  return conflicts;
 }
 
 /**
@@ -382,6 +423,71 @@ export async function handleProjectAdopt(
     hermesModel: config.hermes.model,
     maxAttemptsPerTask: config.hermes.maxAttemptsPerTask,
   };
+
+  // RG-007: resolve the git toplevel of the incoming session's repo
+  // path. This is the project's identity key for collision detection.
+  // Monorepo sub-folders collapse to the same identity — adopting
+  // `~/www/X/apps/api` while `~/www/X/apps/web` has a live Hermes
+  // project is treated as a conflict on `~/www/X`.
+  const repoRoot = await resolveProjectRoot(session.repoPath);
+
+  // RG-007: scan for any other active Hermes projects on the same
+  // repoRoot. If any exist, soft-kill them BEFORE creating the new
+  // project (sequential: scan → kill → wait → adopt, per the
+  // Q3 decision). This implements David's invariant: "one repo,
+  // one Hermes project at a time". The old project's state.json is
+  // preserved on disk (status=killed, supersededBy=newId) so a
+  // future `/project resume` can recover it.
+  const conflictingProjects = await findConflictingProjects(
+    hermesDir,
+    repoRoot,
+    projectId, // exclude this id (defensive; we haven't created it yet)
+  );
+  for (const oldState of conflictingProjects) {
+    try {
+      // Abort any in-flight SDK run on the old project's thread so
+      // the kill feels snappy instead of waiting for the next
+      // iteration check. abortSdkRun is a no-op if no run is active.
+      if (isSdkRunActive(oldState.threadId)) {
+        abortSdkRun(oldState.threadId);
+      }
+      // softExit handles: status flip, endedAt, journal entry,
+      // timer clear, Discord notification, and state save. We
+      // stamp supersededBy AFTER softExit saves so the kill
+      // reason reads as "auto-mode duration expired" rather
+      // than "superseded" — we add a second journal entry to
+      // make the supersede relationship explicit.
+      await softExit(oldState.id, oldState, {
+        hermesDir,
+        thread: thread, // any thread works; softExit only uses it for .send
+        claudeSession: null,
+      }, "manual_switch"); // reuse the manual_switch kill reason
+      // Reload to get the just-saved state, then stamp supersededBy.
+      const reloaded = loadState(hermesDir, oldState.id);
+      if (reloaded) {
+        reloaded.supersededBy = projectId;
+        reloaded.killedReason = "manual_switch"; // keep
+        saveState(hermesDir, oldState.id, reloaded);
+        appendJournal(hermesDir, oldState.id, {
+          type: "status",
+          message: `superseded by new /project adopt (newId=${projectId.slice(0, 8)}, repoRoot=${repoRoot})`,
+        });
+      }
+      log.info("hermes: RG-007 supersede-killed old project", {
+        oldProjectId: oldState.id,
+        oldThreadId: oldState.threadId,
+        newProjectId: projectId,
+        repoRoot,
+      });
+    } catch (err) {
+      // One kill must not abort the adopt chain. Log and continue.
+      log.error("hermes: RG-007 failed to supersede-kill old project", {
+        oldProjectId: oldState.id,
+        err: String(err),
+      });
+    }
+  }
+
   const state = adoptProject({
     hermesDir,
     projectId,
@@ -389,6 +495,7 @@ export async function handleProjectAdopt(
     goal: args.goal,
     mode: args.mode,
     repoPath: session.repoPath,
+    repoRoot,
     repoSource: "local", // adopt always targets an existing local CC session
     config: runtime,
     adoption: {
@@ -430,7 +537,9 @@ export async function handleProjectAdopt(
     threadId,
     mode: state.mode,
     repoPath: state.repoPath,
+    repoRoot,
     adoptedFromSessionId: state.adoption?.originalSessionId,
+    supersededCount: conflictingProjects.length,
   });
 
   // 6. Post kickoff message + run orchestrator (mirror handleProjectStart).
@@ -440,6 +549,15 @@ export async function handleProjectAdopt(
   const timerLine = args.mode === "auto"
     ? `\nTimer: \`${state.timer?.requestedDuration ?? `${config.hermes.maxWallHours}h`}\`${capNote}.`
     : "";
+  // RG-007: if we supersede-killed any old projects, surface that to
+  // the user in the kickoff message so they know what happened. This
+  // is informational, not a confirmation prompt — the kill already
+  // happened by the time the message posts.
+  const supersedeLine = conflictingProjects.length > 0
+    ? `\n⚠️ Superseded ${conflictingProjects.length} existing project(s) on \`${repoRoot}\`: ${
+        conflictingProjects.map((c) => `\`${c.id.slice(0, 8)}\``).join(", ")
+      } (killed, state preserved on disk).`
+    : "";
   await thread.send(
     [
       `🎯 **Hermes project adopted** (from existing CC session)`,
@@ -447,7 +565,7 @@ export async function handleProjectAdopt(
       `Mode: \`${state.mode}\` | Repo: \`${state.repoPath}\` (local, adopted)${timerLine}`,
       `Budget: $${(runtime.maxCostUsd / 100).toFixed(2)} | Max iters: ${runtime.maxIterations} | Wall: ${runtime.maxWallHours}h`,
       ``,
-      `📋 Planning...`,
+      `📋 Planning...${supersedeLine}`,
     ].join("\n"),
   );
 

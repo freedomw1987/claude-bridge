@@ -36,6 +36,7 @@ function baseState(): ProjectState {
     goal: "g",
     mode: "auto",
     repoPath: "/r",
+    repoRoot: "/r",
     repoSource: "new",
     config: DEFAULT_HERMES_CONFIG,
   });
@@ -89,6 +90,7 @@ describe("saveState + loadState", () => {
       goal: "build a CLI",
       mode: "auto",
       repoPath: "/tmp/repo",
+    repoRoot: "/r",
       repoSource: "new",
       config: DEFAULT_HERMES_CONFIG,
     });
@@ -113,6 +115,7 @@ describe("saveState + loadState", () => {
       goal: "g",
       mode: "auto",
       repoPath: "/r",
+    repoRoot: "/r",
       repoSource: "new",
       config: DEFAULT_HERMES_CONFIG,
     });
@@ -142,6 +145,7 @@ describe("saveState + loadState", () => {
       goal: "g",
       mode: "auto",
       repoPath: "/r",
+    repoRoot: "/r",
       repoSource: "new",
       config: DEFAULT_HERMES_CONFIG,
     });
@@ -222,6 +226,7 @@ describe("listProjects", () => {
       goal: `goal for ${id}`,
       mode: "auto",
       repoPath: "/r",
+      repoRoot: "/r",
       repoSource: "new",
       config: DEFAULT_HERMES_CONFIG,
     });

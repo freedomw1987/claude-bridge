@@ -26,6 +26,7 @@ function baseState(): ProjectState {
     goal: "g",
     mode: "auto",
     repoPath: "/r",
+    repoRoot: "/r",
     repoSource: "new",
     config: DEFAULT_HERMES_CONFIG,
   });

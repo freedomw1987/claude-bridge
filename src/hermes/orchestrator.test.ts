@@ -38,6 +38,7 @@ function baseState(overrides: Partial<ProjectState> = {}): ProjectState {
     goal: "g",
     mode: "auto",
     repoPath: "/r",
+    repoRoot: "/r",
     repoSource: "new",
     config: DEFAULT_HERMES_CONFIG,
   });
@@ -576,6 +577,7 @@ function e2eBaseState(projectId: string, overrides: Partial<ProjectState> = {}):
     goal: "g-e2e",
     mode: "auto",
     repoPath: "/r-e2e",
+    repoRoot: "/r",
     repoSource: "new",
     config: DEFAULT_HERMES_CONFIG,
   });

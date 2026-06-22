@@ -20,11 +20,13 @@ import {
   matchResume,
   matchSetMode,
   handleProjectSetMode,
+  handleProjectAdopt,
 } from "./hermesCommands";
 import type { Message, ThreadChannel } from "discord.js";
 import { ensureProjectDir, loadState, saveState } from "../../hermes/state";
 import {
   DEFAULT_HERMES_CONFIG,
+  isActive,
   newProjectState,
   type ProjectState,
 } from "../../hermes/types";
@@ -36,6 +38,32 @@ import { config } from "../../config";
 // instead of the real orchestrator.runProject. We capture the call
 // args in a module-scoped variable so each test can assert against it.
 let runProjectCalls: Array<{ projectId: string; hasUserMsgStub: boolean; claudeSession: string | null }> = [];
+
+// ── RG-007 mock state ────────────────────────────────────────────────
+// Extended (per task spec) so the SAME orchestrator mock also tracks
+// `softExit` and `adoptProject` calls. These are used by
+// `handleProjectAdopt` to kill conflicting same-repoRoot projects and
+// to persist the new project. `softExitShouldThrow` lets I-10 simulate
+// a flaky softExit without aborting the adopt chain.
+let softExitCalls: Array<{
+  projectId: string;
+  reason: "duration_expired" | "manual_switch";
+}> = [];
+let adoptProjectCalls: Array<{
+  projectId: string;
+  repoRoot: string;
+  goal: string;
+  mode: "auto" | "manual";
+}> = [];
+let softExitShouldThrow = false;
+let adoptProjectCreatedIds: Array<{ hermesDir: string; projectId: string }> = [];
+function resetRg007Mocks() {
+  softExitCalls = [];
+  adoptProjectCalls = [];
+  adoptProjectCreatedIds = [];
+  softExitShouldThrow = false;
+}
+
 mock.module("../../hermes/orchestrator", () => {
   return {
     runProject: async (
@@ -49,14 +77,93 @@ mock.module("../../hermes/orchestrator", () => {
       });
     },
     armProjectTimer: () => null, // not used in these tests; no-op
-    softExit: async () => {
-      throw new Error("softExit should not be called in these tests");
+    softExit: async (
+      projectId: string,
+      _state: unknown,
+      _deps: unknown,
+      reason: "duration_expired" | "manual_switch",
+    ) => {
+      softExitCalls.push({ projectId, reason });
+      if (softExitShouldThrow) {
+        throw new Error("simulated softExit failure");
+      }
+      // Return a minimal ProjectState-shaped object. The real handler
+      // ignores the return value here (it reloads via loadState after
+      // softExit) — we just need a non-undefined value to keep the
+      // handler happy if it ever does `await` something off the result.
+      return { id: projectId, status: "killed" };
     },
-    adoptProject: async () => {
-      throw new Error("adoptProject should not be called in these tests");
+    // NOTE: adoptProject is `export function` (synchronous) in the real
+    // module — the handler does `const state = adoptProject(...)` with
+    // NO await. Our mock must therefore return a ProjectState synchronously.
+    // We synthesize one with `newProjectState` so callers that read
+    // `state.timer`, `state.id`, etc. see well-formed values.
+    //
+    // The real `adoptProject` calls `ensureProjectDir` + `saveState`
+    // before returning; we mirror that so the handler's downstream
+    // `saveState` calls (line 518, 540 of hermesCommands.ts) don't fail
+    // with ENOENT.
+    //
+    // We also track the synthesized projectId in a module-scoped
+    // `adoptProjectCreatedIds` so the RG-007 afterEach can clean up
+    // the new project even if the test fails after adoptProject
+    // returns (otherwise a failed test leaves the project on disk
+    // and the next run's findProjectByThread soft-rejects).
+    adoptProject: (input: {
+      hermesDir: string;
+      projectId: string;
+      threadId: string;
+      goal: string;
+      mode: "auto" | "manual";
+      repoRoot: string;
+      repoPath: string;
+    }) => {
+      adoptProjectCalls.push({
+        projectId: input.projectId,
+        repoRoot: input.repoRoot,
+        goal: input.goal,
+        mode: input.mode,
+      });
+      adoptProjectCreatedIds.push({
+        hermesDir: input.hermesDir,
+        projectId: input.projectId,
+      });
+      ensureProjectDir(input.hermesDir, input.projectId);
+      const state: ProjectState = {
+        id: input.projectId,
+        threadId: input.threadId,
+        goal: input.goal,
+        mode: input.mode,
+        repoPath: input.repoPath,
+        repoRoot: input.repoRoot,
+        repoSource: "local" as const,
+        status: "planning" as const,
+        plan: [],
+        currentTaskId: null,
+        iterations: 0,
+        costUsd: 0,
+        config: DEFAULT_HERMES_CONFIG,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        startedAt: new Date().toISOString(),
+        endedAt: null,
+        journal: [],
+      };
+      saveState(input.hermesDir, input.projectId, state);
+      return state;
     },
   };
 });
+
+// ── RG-007: identity mock ─────────────────────────────────────────────
+// `/tmp/rg007-repo` is not a real git working tree in tests. Mock
+// `resolveProjectRoot` to return its input unchanged so each test can
+// drive identity deterministically by setting `session.repoPath` on the
+// fake SessionStore. (Real resolveProjectRoot falls back to the abs
+// path anyway, but mocking removes the spawn-grep dependency.)
+mock.module("../../hermes/projectIdentity", () => ({
+  resolveProjectRoot: async (p: string) => p,
+}));
 
 describe("command matchers", () => {
   describe("isProjectCommand", () => {
@@ -493,6 +600,7 @@ describe("RG-006: setMode auto auto-resumes terminal project", () => {
       goal: "rg006 audit",
       mode: "manual",
       repoPath: "/tmp/rg006",
+      repoRoot: "/tmp/rg006",
       repoSource: "local",
       config: DEFAULT_HERMES_CONFIG,
     });
@@ -689,5 +797,435 @@ describe("RG-006: setMode auto auto-resumes terminal project", () => {
     expect(after.timer!.requestedDuration).toBe("30m");
     expect(after.timer!.effectiveMs).toBe(30 * 60 * 1000);
     expect(after.timer!.clamped).toBe(false);
+  });
+});
+
+// ── RG-007: /project adopt auto-kills same-repoRoot Hermes projects ──
+//
+// One repo = one Hermes project. When `/project adopt` runs, it scans
+// disk for any active project whose `repoRoot` matches the incoming
+// session's git toplevel, and soft-kills them before creating the new
+// project. The flow is sequential (scan → kill → wait → adopt → notify)
+// per the Q3 decision. The old project's state is preserved on disk
+// (status=killed, supersededBy=newId) so a later `/project resume` can
+// recover it.
+//
+// Setup notes:
+// - We mock `../../hermes/projectIdentity` to return the input path
+//   verbatim. Real resolveProjectRoot shells out to `git rev-parse`,
+//   which would tie tests to the repo state. Since the handler treats
+//   the result as opaque string equality, this preserves the exact
+//   collision-detection contract.
+// - We mock `../../hermes/orchestrator` to track `softExit` and
+//   `adoptProject` calls so we can assert on the sequential flow
+//   without actually running the orchestrator or stopping CC.
+// - We pre-populate `<hermesDir>/projects/<id>/state.json` so
+//   findConflictingProjects sees them via listProjects. We also need
+//   to clean up these in afterEach to avoid pollution between tests.
+describe("RG-007: /project adopt auto-kills same-repoRoot conflicts", () => {
+  let hermesDir: string;
+
+  // Minimal SessionStore-shaped mock. handleProjectAdopt reads
+  // session.repoPath to compute repoRoot (via the mocked
+  // resolveProjectRoot). We vary repoPath per test to drive the
+  // collision semantics deterministically.
+  const newFakeStore = (repoPath: string) => {
+    return {
+      get: (_threadId: string) => ({
+        repoPath,
+        claudeSession: "sess-rg007",
+        sdk: "claude-code",
+      }),
+    };
+  };
+
+  const newFakeMsg = (content = "/project adopt \"new goal\"") => {
+    const replies: string[] = [];
+    const threadSends: string[] = [];
+    const msg = {
+      reply: (c: string) => {
+        replies.push(c);
+        return Promise.resolve();
+      },
+      channel: {
+        send: (c: string) => {
+          threadSends.push(c);
+          return Promise.resolve();
+        },
+      } as unknown as ThreadChannel,
+      author: { id: "test-user", bot: false },
+      client: { user: { id: "bot-1" } },
+      channelId: "test-channel",
+      content,
+      mentions: { users: { size: 0, has: () => false } },
+    } as unknown as Message;
+    return { msg, replies, threadSends };
+  };
+
+  // Tracks IDs of projects we created in this test, for cleanup.
+  // Both `seedProject` (pre-existing) and `adoptProject` mock (newly
+  // synthesized) populate this list. We use it in afterEach to wipe
+  // the per-test projects even when the test fails partway through.
+  // Declared before seedProject so the inner closure can read it
+  // (closures hoist by reference, but the declaration needs to exist
+  // before the first use at runtime).
+  const cleanupIds: string[] = [];
+
+  // Build a pre-existing project. `repoRoot` and `status` are the
+  // drivers of collision detection: an active project with the same
+  // repoRoot is a conflict; a terminal project with the same
+  // repoRoot is not.
+  const seedProject = (overrides: {
+    repoRoot: string;
+    status: ProjectState["status"];
+    threadId: string;
+  }): ProjectState => {
+    const tag = Math.random().toString(36).slice(2, 10);
+    const s = newProjectState({
+      id: `old-${tag}`,
+      threadId: overrides.threadId,
+      goal: `seed-${tag}`,
+      mode: "auto",
+      repoPath: overrides.repoRoot,
+      repoRoot: overrides.repoRoot,
+      repoSource: "local",
+      config: DEFAULT_HERMES_CONFIG,
+    });
+    s.status = overrides.status;
+    if (!isActive(s)) {
+      s.endedAt = new Date().toISOString();
+    }
+    ensureProjectDir(hermesDir, s.id);
+    saveState(hermesDir, s.id, s);
+    cleanupIds.push(s.id);
+    return s;
+  };
+
+  // The handler reads hermesDir from config (`<DATA_DIR>/hermes`), NOT
+  // from a test param. So all RG-007 tests share the canonical
+  // hermesDir with RG-006 / state tests. We accept the noise and rely
+  // on:
+  //  (1) wiping any `thread-rg007-*` projects at the start of every
+  //      test (to drop leftover from a prior failed run), and
+  //  (2) wiping everything we created in afterEach.
+  // If RG-007 ever needs hermetic isolation, we'd have to override
+  // config via mock.module — overkill for 10 invariants.
+
+  beforeEach(() => {
+    resetRg007Mocks();
+    runProjectCalls = [];
+    const baseDataDir = process.env.DATA_DIR ?? "/tmp/claude-bridge-test-data";
+    hermesDir = join(baseDataDir, "hermes");
+    // Pre-test wipe: drop any `thread-rg007-*` projects left over from
+    // a prior failed test run. Without this, a fresh-run test would
+    // soft-reject its own adopt because the previous run's project
+    // is still on disk with the same threadId.
+    const { rmSync, readdirSync, existsSync } = require("node:fs") as typeof import("node:fs");
+    if (existsSync(join(hermesDir, "projects"))) {
+      for (const entry of readdirSync(join(hermesDir, "projects"))) {
+        const s = loadState(hermesDir, entry);
+        if (s && s.threadId?.startsWith("thread-rg007-")) {
+          rmSync(join(hermesDir, "projects", entry), {
+            recursive: true,
+            force: true,
+          });
+        }
+      }
+    }
+    cleanupIds.length = 0;
+  });
+
+  afterEach(() => {
+    // Clean up every project we created. We don't wipe the entire
+    // hermesDir because sibling test suites (RG-006, state tests)
+    // share it.
+    const { rmSync } = require("node:fs") as typeof import("node:fs");
+    for (const id of cleanupIds) {
+      rmSync(join(hermesDir, "projects", id), { recursive: true, force: true });
+    }
+  });
+
+  // I-1: fresh repoRoot → no conflicts → adopt succeeds, no softExit
+  test("I-1: adopt on fresh repoRoot does NOT call softExit", async () => {
+    const { msg, threadSends } = newFakeMsg();
+    const store = newFakeStore("/tmp/rg007-fresh");
+
+    await handleProjectAdopt(
+      msg,
+      "thread-rg007-fresh",
+      msg.channel as unknown as ThreadChannel,
+      store as never,
+      { goal: "fresh adopt", mode: "auto" },
+    );
+
+    expect(softExitCalls).toHaveLength(0);
+    expect(adoptProjectCalls).toHaveLength(1);
+    expect(adoptProjectCalls[0].repoRoot).toBe("/tmp/rg007-fresh");
+    // Adopt succeeded, so we should see the "🎯 Hermes project adopted"
+    // kickoff message in threadSends. The handler sends via
+    // thread.send (not msg.reply) for the adopt kickoff (this is
+    // different from handleProjectStart which DOES use msg.reply
+    // for the same kind of message — RG-007 vs RG-004 divergence,
+    // tracked as a follow-up).
+    const adoptConfirm = threadSends.find((s) =>
+      s.includes("Hermes project adopted")
+    );
+    expect(adoptConfirm).toBeDefined();
+    // And the kickoff "📋 Planning..." is in the same thread.send.
+    expect(threadSends.some((s) => s.includes("Planning"))).toBe(true);
+    // No "Superseded" line on a fresh-repoRoot adopt (I-1 negative case).
+    expect(threadSends.some((s) => s.includes("Superseded"))).toBe(false);
+  });
+
+  // I-2: one active conflict → softExit + adopt + supersedeBy stamped
+  test("I-2: adopt on repoRoot with 1 active project soft-kills it first", async () => {
+    const old = seedProject({
+      repoRoot: "/tmp/rg007-busy",
+      status: "executing",
+      threadId: "thread-old-busy",
+    });
+    const { msg } = newFakeMsg();
+    const store = newFakeStore("/tmp/rg007-busy");
+
+    await handleProjectAdopt(
+      msg,
+      "thread-rg007-busy",
+      msg.channel as unknown as ThreadChannel,
+      store as never,
+      { goal: "supersede one", mode: "auto" },
+    );
+
+    // softExit called once for the old project
+    expect(softExitCalls).toHaveLength(1);
+    expect(softExitCalls[0].projectId).toBe(old.id);
+    // adopt called once for the new project
+    expect(adoptProjectCalls).toHaveLength(1);
+    // The old project's state on disk has been stamped supersededBy
+    const reloaded = loadState(hermesDir, old.id);
+    expect(reloaded).not.toBeNull();
+    expect(reloaded!.supersededBy).toBeDefined();
+    expect(adoptProjectCalls[0].repoRoot).toBe("/tmp/rg007-busy");
+  });
+
+  // I-3: two active conflicts → soft-kill BOTH, then adopt
+  test("I-3: adopt on repoRoot with 2 active projects soft-kills both sequentially", async () => {
+    const old1 = seedProject({
+      repoRoot: "/tmp/rg007-double",
+      status: "executing",
+      threadId: "thread-old-double-1",
+    });
+    const old2 = seedProject({
+      repoRoot: "/tmp/rg007-double",
+      status: "planning",
+      threadId: "thread-old-double-2",
+    });
+    const { msg } = newFakeMsg();
+    const store = newFakeStore("/tmp/rg007-double");
+
+    await handleProjectAdopt(
+      msg,
+      "thread-rg007-double",
+      msg.channel as unknown as ThreadChannel,
+      store as never,
+      { goal: "supersede two", mode: "auto" },
+    );
+
+    expect(softExitCalls).toHaveLength(2);
+    const killedIds = softExitCalls.map((c) => c.projectId).sort();
+    expect(killedIds).toEqual([old1.id, old2.id].sort());
+    expect(adoptProjectCalls).toHaveLength(1);
+  });
+
+  // I-4: terminal conflict (status=killed) → NOT a conflict, adopt
+  // proceeds without softExit. This pins the "preserve killed state,
+  // don't re-kill dead projects" invariant from the Q2 decision.
+  test("I-4: terminal (killed) project on same repoRoot is NOT a conflict", async () => {
+    const dead = seedProject({
+      repoRoot: "/tmp/rg007-dead",
+      status: "killed",
+      threadId: "thread-old-dead",
+    });
+    const { msg } = newFakeMsg();
+    const store = newFakeStore("/tmp/rg007-dead");
+
+    await handleProjectAdopt(
+      msg,
+      "thread-rg007-dead",
+      msg.channel as unknown as ThreadChannel,
+      store as never,
+      { goal: "adopt over dead", mode: "auto" },
+    );
+
+    expect(softExitCalls).toHaveLength(0);
+    expect(adoptProjectCalls).toHaveLength(1);
+    // The dead project's state is preserved unchanged
+    const reloaded = loadState(hermesDir, dead.id);
+    expect(reloaded!.status).toBe("killed");
+    expect(reloaded!.supersededBy).toBeUndefined();
+  });
+
+  // I-5: monorepo sub-folder collapse — the mock for resolveProjectRoot
+  // is identity (returns input as-is), so to simulate the collapse we
+  // must use the SAME repoRoot string for both old + new. This is the
+  // "we'd get the same string from `git rev-parse`" simulation. The
+  // point of this test: a project on `~/www/X/apps/web` and a new
+  // adopt on `~/www/X/apps/api` would both resolve to `~/www/X` in
+  // production, and the test proves the handler treats them as a
+  // conflict on the resolved root.
+  test("I-5: monorepo sub-folders collapse (same resolved repoRoot → conflict)", async () => {
+    const old = seedProject({
+      repoRoot: "/tmp/rg007-monorepo-root",
+      status: "executing",
+      threadId: "thread-old-monorepo",
+    });
+    const { msg } = newFakeMsg();
+    // New session's repoPath is a sub-folder, but in our mock
+    // resolveProjectRoot returns it verbatim, so we use the SAME
+    // repoRoot string to simulate the git-toplevel collapse.
+    const store = newFakeStore("/tmp/rg007-monorepo-root");
+
+    await handleProjectAdopt(
+      msg,
+      "thread-rg007-monorepo",
+      msg.channel as unknown as ThreadChannel,
+      store as never,
+      { goal: "monorepo sub-adopt", mode: "auto" },
+    );
+
+    expect(softExitCalls).toHaveLength(1);
+    expect(softExitCalls[0].projectId).toBe(old.id);
+  });
+
+  // I-6: different repoRoot → no conflict, no softExit
+  test("I-6: adopt on DIFFERENT repoRoot does NOT kill other projects", async () => {
+    seedProject({
+      repoRoot: "/tmp/rg007-unrelated-A",
+      status: "executing",
+      threadId: "thread-old-A",
+    });
+    seedProject({
+      repoRoot: "/tmp/rg007-unrelated-B",
+      status: "executing",
+      threadId: "thread-old-B",
+    });
+    const { msg } = newFakeMsg();
+    const store = newFakeStore("/tmp/rg007-unrelated-C");
+
+    await handleProjectAdopt(
+      msg,
+      "thread-rg007-unrelated-C",
+      msg.channel as unknown as ThreadChannel,
+      store as never,
+      { goal: "totally different repo", mode: "auto" },
+    );
+
+    expect(softExitCalls).toHaveLength(0);
+    expect(adoptProjectCalls).toHaveLength(1);
+    expect(adoptProjectCalls[0].repoRoot).toBe("/tmp/rg007-unrelated-C");
+  });
+
+  // I-7: supersede notification in kickoff thread.send contains old IDs
+  test("I-7: kickoff thread.send contains 'Superseded' line with old project IDs", async () => {
+    const old = seedProject({
+      repoRoot: "/tmp/rg007-notify",
+      status: "executing",
+      threadId: "thread-old-notify",
+    });
+    const { msg, threadSends } = newFakeMsg();
+    const store = newFakeStore("/tmp/rg007-notify");
+
+    await handleProjectAdopt(
+      msg,
+      "thread-rg007-notify",
+      msg.channel as unknown as ThreadChannel,
+      store as never,
+      { goal: "with notify", mode: "auto" },
+    );
+
+    // The kickoff message goes via thread.send, not msg.reply. Look in
+    // threadSends for the "Superseded" line that lists the truncated
+    // old project id.
+    const supersededMsg = threadSends.find((s) => s.includes("Superseded"));
+    expect(supersededMsg).toBeDefined();
+    expect(supersededMsg!).toContain(old.id.slice(0, 8));
+  });
+
+  // I-8: state.json on the new project persists repoRoot
+  test("I-8: adopted new project has repoRoot stored in state", async () => {
+    seedProject({
+      repoRoot: "/tmp/rg007-store",
+      status: "killed",
+      threadId: "thread-old-store",
+    });
+    const { msg } = newFakeMsg();
+    const store = newFakeStore("/tmp/rg007-store");
+
+    await handleProjectAdopt(
+      msg,
+      "thread-rg007-store",
+      msg.channel as unknown as ThreadChannel,
+      store as never,
+      { goal: "store repoRoot", mode: "auto" },
+    );
+
+    // adoptProject was called with the right repoRoot. (The mock
+    // returns a synthesized state but does NOT persist it — the
+    // real handler also calls saveState, but with the mock we verify
+    // via the adoptProjectCalls capture.)
+    expect(adoptProjectCalls[0].repoRoot).toBe("/tmp/rg007-store");
+  });
+
+  // I-9: supersededBy on old state points to the NEW project id
+  test("I-9: supersededBy on old state points to the new project id", async () => {
+    const old = seedProject({
+      repoRoot: "/tmp/rg007-super",
+      status: "executing",
+      threadId: "thread-old-super",
+    });
+    const { msg } = newFakeMsg();
+    const store = newFakeStore("/tmp/rg007-super");
+
+    await handleProjectAdopt(
+      msg,
+      "thread-rg007-super",
+      msg.channel as unknown as ThreadChannel,
+      store as never,
+      { goal: "supersedeBy stamp", mode: "auto" },
+    );
+
+    const reloaded = loadState(hermesDir, old.id);
+    expect(reloaded!.supersededBy).toBe(adoptProjectCalls[0].projectId);
+  });
+
+  // I-10: softExit failure does NOT abort the adopt chain
+  // If one old project's softExit throws, the handler should log +
+  // continue to adopt. This is the "defensive sequential" guarantee.
+  test("I-10: softExit failure on one project does NOT abort adopt chain", async () => {
+    seedProject({
+      repoRoot: "/tmp/rg007-flaky",
+      status: "executing",
+      threadId: "thread-old-flaky",
+    });
+    softExitShouldThrow = true;
+    const { msg, threadSends } = newFakeMsg();
+    const store = newFakeStore("/tmp/rg007-flaky");
+
+    // Should NOT throw — handler catches per-kill errors.
+    await handleProjectAdopt(
+      msg,
+      "thread-rg007-flaky",
+      msg.channel as unknown as ThreadChannel,
+      store as never,
+      { goal: "flaky softExit", mode: "auto" },
+    );
+
+    // adopt still succeeded despite softExit throwing
+    expect(adoptProjectCalls).toHaveLength(1);
+    // The handler still posted the adopt confirmation (via
+    // thread.send, not msg.reply — see I-1 comment for the
+    // RG-007 vs RG-004 divergence note) AND the kickoff
+    // thread.send.
+    expect(threadSends.some((s) => s.includes("Hermes project adopted"))).toBe(true);
+    expect(threadSends.some((s) => s.includes("Planning"))).toBe(true);
   });
 });

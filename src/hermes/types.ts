@@ -146,6 +146,26 @@ export interface ProjectState {
    * — its presence is purely informational.
    */
   adoption?: ProjectAdoption;
+  /**
+   * Git toplevel of `repoPath` at project-creation time. Populated by
+   * `newProjectState` / `adoptProject` (RG-007) and used as the
+   * identity key for `/project adopt` collision detection. Two
+   * projects with the same `repoRoot` are considered the same project
+   * for the purpose of auto-killing superseded projects on adopt.
+   *
+   * If `repoPath` is not inside a git working tree, this falls back
+   * to the absolute path of `repoPath` (see `projectIdentity.ts`).
+   */
+  repoRoot: string;
+  /**
+   * Set when a project is auto-killed by a subsequent `/project adopt`
+   * on the same `repoRoot` (RG-007). Records the projectId of the
+   * superseding project so the kill reason is traceable from the
+   * killed state alone. The old state is preserved on disk so a later
+   * `/project resume` (or even `/project adopt` from a different
+   * thread) can recover it. Set only on the killed (old) side.
+   */
+  supersededBy?: string;
 }
 
 /**
@@ -219,6 +239,7 @@ export function newProjectState(input: {
   goal: string;
   mode: ProjectMode;
   repoPath: string;
+  repoRoot: string;
   repoSource: "new" | "clone" | "local";
   config: HermesRuntimeConfig;
 }): ProjectState {
@@ -232,6 +253,7 @@ export function newProjectState(input: {
     mode: input.mode,
     repoPath: input.repoPath,
     repoSource: input.repoSource,
+    repoRoot: input.repoRoot,
     status: "planning",
     plan: [],
     currentTaskId: null,

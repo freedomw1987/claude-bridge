@@ -758,6 +758,7 @@ export function adoptProject(input: {
   goal: string;
   mode: ProjectMode;
   repoPath: string;
+  repoRoot: string;
   repoSource: "new" | "clone" | "local";
   config: HermesRuntimeConfig;
   adoption: ProjectAdoption;
@@ -769,6 +770,7 @@ export function adoptProject(input: {
     goal: input.goal,
     mode: input.mode,
     repoPath: input.repoPath,
+    repoRoot: input.repoRoot,
     repoSource: input.repoSource,
     config: input.config,
   });
@@ -776,12 +778,13 @@ export function adoptProject(input: {
   saveState(input.hermesDir, input.projectId, state);
   appendJournal(input.hermesDir, input.projectId, {
     type: "adopt",
-    message: `thread adopted from CC session; originalRepoPath=${input.adoption.originalRepoPath}, originalSessionId=${input.adoption.originalSessionId.slice(0, 12)}…`,
+    message: `thread adopted from CC session; repoRoot=${input.repoRoot}, originalSessionId=${input.adoption.originalSessionId.slice(0, 12)}…`,
   });
   log.info("hermes: project adopted from CC session", {
     projectId: input.projectId,
     threadId: input.threadId,
     repoPath: input.repoPath,
+    repoRoot: input.repoRoot,
     repoSource: input.repoSource,
     mode: input.mode,
   });
