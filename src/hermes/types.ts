@@ -17,6 +17,13 @@
  * "executing" can loop back into itself: judge verdict "needs_more" appends
  * new tasks and re-enters the loop. "judging" can also go back to "executing"
  * if a task is added by the judge.
+ *
+ * Auto-mode timer (ADR-0004):
+ *   When `/project setMode auto <duration>` is invoked, a `ProjectTimer` is
+ *   attached to the state. The orchestrator's judging boundary checks
+ *   `state.timer.expiresAt` on every pass; if past, the project transitions
+ *   to `killed` with `killedReason: "duration_expired"`. The `handle` field
+ *   is a transient NodeJS Timeout and is NOT serialized.
  */
 
 export type ProjectMode = "auto" | "manual";
@@ -28,6 +35,16 @@ export type ProjectStatus =
   | "done"
   | "failed"
   | "killed";
+
+/**
+ * Sub-reason for `killed` status. The base state machine has 3 terminal
+ * states; "killed" can be reached by 3 different paths and we want to
+ * surface *which* path in `/project status` and the journal.
+ */
+export type KilledReason =
+  | "user_kill" // /project kill command
+  | "duration_expired" // auto-mode timer fired
+  | "manual_switch"; // /project setMode manual cancelled auto-mode
 
 export type TaskStatus =
   | "pending"
@@ -44,7 +61,8 @@ export type JournalEntryType =
   | "judge"
   | "status"
   | "escalate"
-  | "resume";
+  | "resume"
+  | "timer";
 
 export interface Task {
   id: string;
@@ -105,6 +123,17 @@ export interface ProjectState {
   lastVerdict?: JudgeVerdict;
   /** In-memory journal mirror; journal.log is the durable copy. */
   journal: JournalEntry[];
+  /**
+   * Auto-mode timer (ADR-0004). Set when `/project setMode auto <duration>`
+   * is invoked. The `handle` field is process-local and stripped before
+   * serialization; `expiresAt` is wallclock ms and is the source of truth.
+   */
+  timer?: ProjectTimer;
+  /**
+   * Sub-reason for `killed` status. Null/undefined for non-killed states.
+   * Surfaced in `/project status` and the journal entry on transition.
+   */
+  killedReason?: KilledReason;
 }
 
 export type JudgeVerdictType = "done" | "needs_more" | "stuck";
@@ -114,6 +143,26 @@ export interface JudgeVerdict {
   reasoning: string;
   /** Tasks to add if verdict === "needs_more". */
   nextTasks?: Task[];
+}
+
+/**
+ * Auto-mode timer (ADR-0004). Attached to a `ProjectState` when the user
+ * runs `/project setMode auto <duration>`. The `handle` is a transient
+ * NodeJS Timeout reference — it is intentionally optional and is the only
+ * field that should be stripped before `JSON.stringify` and re-hydrated
+ * after `JSON.parse` (via `state.ts`'s `loadState` / `saveState` helpers).
+ */
+export interface ProjectTimer {
+  /** Wallclock ms since epoch when the timer should fire. */
+  expiresAt: number;
+  /** NodeJS Timeout handle. NOT serialized. */
+  handle?: ReturnType<typeof setTimeout>;
+  /** Original user-requested duration string (e.g. "30m", "1h30m"). */
+  requestedDuration: string;
+  /** Effective duration in ms (clamped to HERMES_MAX_WALL_HOURS). */
+  effectiveMs: number;
+  /** True if user_duration > HERMES_MAX_WALL_HOURS and was clamped. */
+  clamped: boolean;
 }
 
 /** Initial runtime config defaults; overridable via env vars. */
