@@ -50,6 +50,7 @@ import {
   makeHermesSend,
 } from "./discord";
 import { TypingIndicator } from "./typing";
+import { makeClaudeSend } from "../discord/handlers/streaming";
 import { join } from "node:path";
 import { mkdirSync } from "node:fs";
 
@@ -282,13 +283,20 @@ async function runOneTask(
   });
   await deps.thread.send(formatTaskStart(state, task));
 
+  // RG-005 / UX-3: wrap with makeClaudeSend so CC replies posted via
+  // the SDK's auto-post path get the "🤖 Claude Code:" prefix.
+  // Same fix as runManualProject — without this, auto-mode task output
+  // would post raw CC text to Discord with no visual tag, blending
+  // into Hermes status messages. See REGRESSION-GUARD.md RG-005.
+  const claudeSend = makeClaudeSend(deps.thread);
+
   const execDeps: ExecutorDeps = {
     thread: deps.thread,
     repoPath: state.repoPath,
     claudeSession: deps.resolveClaudeSession
       ? deps.resolveClaudeSession(state.threadId)
       : deps.claudeSession,
-    send: (content) => deps.thread.send(content).then(() => ({} as import("discord.js").Message)),
+    send: claudeSend,
     userMsgStub: deps.userMsgStub,
   };
 
@@ -638,6 +646,14 @@ export async function runManualProject(
   const typing = new TypingIndicator(deps.thread);
   typing.start();
 
+  // RG-005 / UX-3: wrap with makeClaudeSend so CC replies posted via
+  // the SDK's auto-post path get the "🤖 Claude Code:" prefix.
+  // Without this, manual-mode projects (and any future Hermes runner
+  // that bypasses streaming.ts:forwardToClaude) would post raw CC text
+  // to Discord with no visual tag, blending into Hermes/own output.
+  // See REGRESSION-GUARD.md RG-005.
+  const claudeSend = makeClaudeSend(deps.thread);
+
   let result: SdkRunResult;
   try {
     result = await runViaSdk(
@@ -649,8 +665,7 @@ export async function runManualProject(
         claudeSession: deps.claudeSession,
         repoPath: state.repoPath,
       },
-      (content) =>
-        deps.thread.send(content).then(() => ({} as import("discord.js").Message)),
+      claudeSend,
     );
   } catch (err) {
     log.error("hermes manual: runViaSdk threw", {

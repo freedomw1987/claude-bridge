@@ -38,6 +38,24 @@ import { truncate, stripThinkTags, containsQuestion, formatToolUse, TOOL_ICON } 
 export const CLAUDE_PREFIX = "🤖 **Claude Code:**";
 
 /**
+ * RG-005: branded type for a Discord-send function that has been wrapped
+ * with `makeClaudeSend`. The phantom `__brand` field is invisible at
+ * runtime (never set or read) but forces TypeScript to reject any
+ * `thread.send` / `channel.send` raw pass-through at the `runViaSdk`
+ * call site. The only way to satisfy this type is to wrap with
+ * `makeClaudeSend(thread, queue?)`, which prepends CLAUDE_PREFIX.
+ *
+ * Why branded instead of a generic alias: without the brand, a raw
+ * `(content: string) => Promise<Message>` from `thread.send` is
+ * structurally compatible with `makeClaudeSend`'s return type, and
+ * the compiler would silently accept either — re-introducing the
+ * very regression RG-005 exists to prevent.
+ */
+export type PrefixedSend = (content: string) => Promise<Message> & {
+  readonly __brand: "PrefixedSend";
+};
+
+/**
  * Build a Discord-send function that prefixes every message with
  * `CLAUDE_PREFIX`. Used by both the CLI and SDK runner paths so that
  * `discord_send` tool calls and streamed text are visually tagged the
@@ -59,12 +77,12 @@ export const CLAUDE_PREFIX = "🤖 **Claude Code:**";
 export function makeClaudeSend(
   thread: ThreadChannel,
   queue?: SendQueue,
-): (content: string) => Promise<Message> {
+): PrefixedSend {
   const post = (text: string): Promise<Message> =>
     queue
       ? queue.send<Message>((c) => thread.send(c), text)
       : thread.send(text);
-  return async (content: string): Promise<Message> => {
+  const fn = async (content: string): Promise<Message> => {
     if (!content) {
       // Should not happen — callers must check empty before calling —
       // but guard anyway so we never return a fake Message.
@@ -78,6 +96,7 @@ export function makeClaudeSend(
     }
     return first;
   };
+  return fn as PrefixedSend;
 }
 
 // ---- Discord helpers ----

@@ -140,7 +140,9 @@ export async function runViaSdk(
     claudeSession: string | null;
     repoPath: string;
   },
-  send: (content: string) => Promise<import("discord.js").Message>,
+  // RG-005: branded type — must be the result of `makeClaudeSend(thread, queue?)`.
+  // A raw `thread.send` / `channel.send` wrapper will fail to compile here.
+  send: import("../discord/handlers/streaming").PrefixedSend,
 ): Promise<SdkRunResult> {
   // Bind thread + send into the MCP tool handlers.
   const deps: DiscordToolDeps = { thread, send };

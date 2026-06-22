@@ -3,7 +3,7 @@
  * Does NOT exercise the full orchestrator loop (which requires Discord + SDK).
  */
 
-import { describe, test, expect, beforeEach, afterEach } from "bun:test";
+import { describe, test, expect, beforeEach, afterEach, mock } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -13,7 +13,10 @@ import {
   pickNextTask,
   shouldStop,
   softExit,
+  runProject,
+  runManualProject,
 } from "./orchestrator";
+import { CLAUDE_PREFIX } from "../discord/handlers/streaming";
 import {
   appendJournal,
   ensureProjectDir,
@@ -746,4 +749,206 @@ describe("E2E M2.11 — timer fires → softExit (duration_expired)", () => {
       expect(thread.sent.length).toBe(1);
     },
   );
+});
+
+// ── RG-005: CC prefix is enforced on Hermes runner paths ──────────────
+//
+// Audit test: the `send` callback passed to `runViaSdk` from Hermes's
+// runner paths MUST be a PrefixedSend (i.e., produced by
+// `makeClaudeSend(thread)`). Otherwise, Claude Code's auto-posted text
+// reaches Discord without the "🤖 **Claude Code:**" prefix, blending
+// into Hermes metadata messages.
+//
+// Two call sites are covered:
+//   1. runManualProject (orchestrator.ts:655-669) — manual-mode single
+//      prompt dispatch.
+//   2. runProject (orchestrator.ts:291-303, via executor.ts:60-70) —
+//      auto-mode per-task dispatch through executeTask.
+//
+// Strategy: mock `../agent/sdkRunner` so the test captures the `send`
+// callback the orchestrator would hand to the real SDK. After invoking
+// the public function, manually call the captured `send` with a known
+// payload and assert the fake thread received the prefixed text. If
+// someone removes the `makeClaudeSend(thread)` wrap, the captured
+// callback will be a raw thread.send wrapper and the prefix assertion
+// will fail.
+//
+// NOTE: We deliberately do NOT cast capturedSend as PrefixedSend — the
+// branded `__brand` field is a typecheck-time invariant only. At
+// runtime the brand is invisible, so what we're really asserting is
+// "calling this function prepends CLAUDE_PREFIX to thread-bound sends".
+// That's exactly the user-visible behavior we want pinned.
+
+// Captured by the mock. Reset per-test via beforeEach below.
+let rg005CapturedSend:
+  | ((content: string) => Promise<unknown>)
+  | null = null;
+
+// Local mirror of `fakeThread()` / `asThread(t)` from
+// src/discord/handlers/streaming.test.ts. Kept local (not imported) so
+// this test file remains self-contained — bun's mock.module machinery
+// has known friction with cross-file test helpers, and the FakeThread
+// surface here only needs to satisfy `makeClaudeSend`'s call shape.
+class Rg005FakeMessage {
+  constructor(
+    public readonly id: string,
+    public readonly content: string,
+  ) {}
+}
+
+interface Rg005FakeThread {
+  sent: string[];
+  lastMessage: Rg005FakeMessage | null;
+  send: (content: string) => Promise<Rg005FakeMessage>;
+  // TypingIndicator.start() calls thread.sendTyping() on a setInterval
+  // (see src/hermes/typing.ts). The interval is cleared by typing.stop()
+  // in the orchestrator's finally block, so a no-op stub here is enough.
+  sendTyping: () => Promise<void>;
+}
+
+function fakeThread(): Rg005FakeThread {
+  const t: Rg005FakeThread = {
+    sent: [],
+    lastMessage: null,
+    send: async (content: string) => {
+      const m = new Rg005FakeMessage(`msg-${t.sent.length}`, content);
+      t.sent.push(content);
+      t.lastMessage = m;
+      return m;
+    },
+    sendTyping: async () => {
+      // No-op — we don't assert on typing traffic.
+    },
+  };
+  return t;
+}
+
+function asThread(
+  t: Rg005FakeThread,
+): import("discord.js").ThreadChannel {
+  // Only the `send` method is consumed by makeClaudeSend. The cast is
+  // safe for testing the prefix + chunking logic in isolation.
+  return t as unknown as import("discord.js").ThreadChannel;
+}
+
+// The mock factory: returns a fake `runViaSdk` that captures the 5th
+// argument (`send`) and pretends Claude Code finished successfully.
+// `mock.module` is hoisted by bun to run before the test file's
+// top-level imports resolve, so the orchestrator/executor modules pick
+// up this fake instead of the real SDK runner.
+mock.module("../agent/sdkRunner", () => {
+  return {
+    runViaSdk: async (
+      _userMsg: unknown,
+      _thread: unknown,
+      _prompt: unknown,
+      _session: unknown,
+      send: (content: string) => Promise<unknown>,
+    ) => {
+      rg005CapturedSend = send;
+      return {
+        sessionId: "fake-session",
+        durationMs: 100,
+        costUsd: 0,
+        inputTokens: 0,
+        outputTokens: 0,
+        isError: false,
+        aborted: false,
+        toolCallCount: 0,
+        numTurns: 1,
+      };
+    },
+  };
+});
+
+// After the (mocked) task completes successfully, runProject's auto
+// loop sees no more pending work, transitions status → "judging", and
+// then invokes judgeProject(...) — which in turn spawns the real CC
+// subprocess. That subprocess launch fails on this sandbox (no native
+// binary), spewing an error log AFTER our audit assertion has already
+// passed. Stub judge to a verdict of "done" so the loop exits cleanly
+// and the test log stays tidy.
+mock.module("./judge", () => {
+  return {
+    judgeProject: async () => ({
+      verdict: "done" as const,
+      reasoning: "rg005 audit: judge stubbed",
+    }),
+  };
+});
+
+describe("RG-005: CC prefix is enforced on Hermes runner paths", () => {
+  // The mock.module above replaces ../agent/sdkRunner globally. Both
+  // `orchestrator.ts` and `executor.ts` import from that same module
+  // path, so one mock covers both call sites.
+
+  beforeEach(() => {
+    rg005CapturedSend = null;
+    // Fresh hermesDir per test so saveState/loadState are isolated.
+    tmpRoot = mkdtempSync(join(tmpdir(), "hermes-rg005-"));
+    hermesDir = join(tmpRoot, "hermes");
+  });
+
+  test("runManualProject wraps send with makeClaudeSend (🤖 prefix applied)", async () => {
+    const t = fakeThread();
+
+    // Persist a manual-mode project on disk. runManualProject will
+    // loadState(...) then dispatch straight into runViaSdk.
+    const state = baseState({ mode: "manual", status: "executing" });
+    ensureProjectDir(hermesDir, state.id);
+    saveState(hermesDir, state.id, state);
+
+    await runManualProject(state.id, {
+      hermesDir,
+      thread: asThread(t),
+      claudeSession: null,
+    });
+
+    // The SDK mock should have captured whatever send callback the
+    // orchestrator handed it. If line 655's `makeClaudeSend(deps.thread)`
+    // is removed and replaced with a raw wrapper, the captured callback
+    // will still execute — but it will NOT prepend CLAUDE_PREFIX.
+    expect(rg005CapturedSend).not.toBeNull();
+
+    // Drive the captured callback and assert the prefix landed.
+    await rg005CapturedSend!("hello from CC");
+
+    const sent = t.sent.find((s) => s.includes("hello from CC"));
+    expect(sent).toBeDefined();
+    expect(sent).toBe(`${CLAUDE_PREFIX} hello from CC`);
+    expect(sent?.startsWith(CLAUDE_PREFIX)).toBe(true);
+  });
+
+  test("runProject auto-mode wraps send with makeClaudeSend (🤖 prefix applied)", async () => {
+    const t = fakeThread();
+
+    // Auto-mode project with one pending task. We deliberately start
+    // at status="executing" so the orchestrator skips the planning
+    // phase and dives straight into runOneTask → executeTask → runViaSdk.
+    const state = baseState({
+      mode: "auto",
+      status: "executing",
+      plan: [task("t1", "pending")],
+    });
+    ensureProjectDir(hermesDir, state.id);
+    saveState(hermesDir, state.id, state);
+
+    await runProject(state.id, {
+      hermesDir,
+      thread: asThread(t),
+      claudeSession: null,
+    });
+
+    // The SDK mock should have captured the claudeSend passed through
+    // executor.executeTask. If line 291's `makeClaudeSend(deps.thread)`
+    // is removed, the captured callback loses the prefix.
+    expect(rg005CapturedSend).not.toBeNull();
+
+    await rg005CapturedSend!("hello from CC auto");
+
+    const sent = t.sent.find((s) => s.includes("hello from CC auto"));
+    expect(sent).toBeDefined();
+    expect(sent).toBe(`${CLAUDE_PREFIX} hello from CC auto`);
+    expect(sent?.startsWith(CLAUDE_PREFIX)).toBe(true);
+  });
 });

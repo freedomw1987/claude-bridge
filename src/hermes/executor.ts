@@ -13,12 +13,14 @@ import type { ThreadChannel, Message } from "discord.js";
 import { runViaSdk, type SdkRunResult } from "../agent/sdkRunner";
 import type { ProjectState, Task } from "./types";
 import { log } from "../logger";
+import type { PrefixedSend } from "../discord/handlers/streaming";
 
 export interface ExecutorDeps {
   thread: ThreadChannel;
   repoPath: string;
   claudeSession: string | null;
-  send: (content: string) => Promise<Message>;
+  // RG-005: branded type — must be the result of `makeClaudeSend(thread, queue?)`.
+  send: PrefixedSend;
   /**
    * Optional stub for runViaSdk's first arg. The SDK currently ignores
    * this argument entirely (see src/agent/sdkRunner.ts: `void userMsg`),
