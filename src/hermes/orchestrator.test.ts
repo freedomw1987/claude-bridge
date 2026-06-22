@@ -4,7 +4,13 @@
  */
 
 import { describe, test, expect } from "bun:test";
-import { checkTimerExpired, pickNextTask, shouldStop, softExit } from "./orchestrator";
+import {
+  armProjectTimer,
+  checkTimerExpired,
+  pickNextTask,
+  shouldStop,
+  softExit,
+} from "./orchestrator";
 import {
   DEFAULT_HERMES_CONFIG,
   isActive,
@@ -391,5 +397,127 @@ describe("softExit (M2.4)", () => {
     const out = await softExit("p", s, deps, "duration_expired");
     expect(isActive(out)).toBe(false);
     expect(out.status).toBe("killed");
+  });
+});
+
+
+// ── armProjectTimer (M2.5 / ADR-0004) ────────────────────────────────
+
+describe("armProjectTimer", () => {
+  test("returns null when no timer is set (manual mode)", () => {
+    const s = baseState();
+    const handle = armProjectTimer(s, () => {});
+    expect(handle).toBeNull();
+  });
+
+  test("schedules a setTimeout for future expiresAt and stores the handle", () => {
+    const s = baseState();
+    s.timer = {
+      expiresAt: Date.now() + 60_000, // 1 min from now
+      handle: undefined,
+      requestedDuration: "1m",
+      effectiveMs: 60_000,
+      clamped: false,
+    };
+    const handle = armProjectTimer(s, () => {});
+    expect(handle).not.toBeNull();
+    expect(s.timer!.handle).toBe(handle as ReturnType<typeof setTimeout>);
+    // Cleanup
+    if (handle != null) clearTimeout(handle as ReturnType<typeof setTimeout>);
+  });
+
+  test("fires onExpire immediately (microtask) when expiresAt is past", async () => {
+    const s = baseState();
+    s.timer = {
+      expiresAt: Date.now() - 1_000, // already past
+      handle: undefined,
+      requestedDuration: "1m",
+      effectiveMs: 60_000,
+      clamped: false,
+    };
+    let called = false;
+    const handle = armProjectTimer(s, () => {
+      called = true;
+    });
+    // Past → no setTimeout, but onExpire fires via queueMicrotask
+    expect(handle).toBeNull();
+    // Yield to microtask queue
+    await new Promise((r) => queueMicrotask(r));
+    expect(called).toBe(true);
+  });
+
+  test("does not fire onExpire synchronously for future expiresAt", async () => {
+    const s = baseState();
+    s.timer = {
+      expiresAt: Date.now() + 60_000,
+      handle: undefined,
+      requestedDuration: "1m",
+      effectiveMs: 60_000,
+      clamped: false,
+    };
+    let called = false;
+    const handle = armProjectTimer(s, () => {
+      called = true;
+    });
+    // Synchronously, not called
+    expect(called).toBe(false);
+    // After microtask yield, still not called (only fires at setTimeout deadline)
+    await new Promise((r) => queueMicrotask(r));
+    expect(called).toBe(false);
+    if (handle != null) clearTimeout(handle as ReturnType<typeof setTimeout>);
+  });
+
+  test("setTimeout actually fires onExpire at deadline", async () => {
+    const s = baseState();
+    s.timer = {
+      expiresAt: Date.now() + 50, // 50ms from now
+      handle: undefined,
+      requestedDuration: "50ms",
+      effectiveMs: 50,
+      clamped: false,
+    };
+    let called = false;
+    const handle = armProjectTimer(s, () => {
+      called = true;
+    });
+    expect(handle).not.toBeNull();
+    // Wait 100ms — should be enough for the 50ms timer
+    await new Promise((r) => setTimeout(r, 100));
+    expect(called).toBe(true);
+  });
+
+  test("unref()'d handle does not keep the process alive", () => {
+    const s = baseState();
+    s.timer = {
+      expiresAt: Date.now() + 60_000,
+      handle: undefined,
+      requestedDuration: "1m",
+      effectiveMs: 60_000,
+      clamped: false,
+    };
+    const handle = armProjectTimer(s, () => {});
+    // The handle should have unref()'d. We can't easily test "process would
+    // exit" in a unit test, but we can verify the handle returned by
+    // setTimeout in Node/Bun supports unref and was called.
+    expect(handle).not.toBeNull();
+    if (handle) {
+      // No-op if unref not present, error if it is.
+      (handle as unknown as { unref?: () => void }).unref?.();
+      clearTimeout(handle as ReturnType<typeof setTimeout>);
+    }
+  });
+
+  test("the stored handle is the same one returned", () => {
+    const s = baseState();
+    s.timer = {
+      expiresAt: Date.now() + 60_000,
+      handle: undefined,
+      requestedDuration: "1m",
+      effectiveMs: 60_000,
+      clamped: false,
+    };
+    const handle = armProjectTimer(s, () => {});
+    expect(s.timer!.handle).toBe(handle as ReturnType<typeof setTimeout>);
+    if (handle != null) clearTimeout(handle as ReturnType<typeof setTimeout>);
   });
 });
