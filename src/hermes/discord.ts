@@ -10,6 +10,7 @@
 
 import type { ThreadChannel } from "discord.js";
 import type { ProjectState, Task } from "./types";
+import { formatCountdown } from "./duration";
 
 export const HERMES_PREFIX = "🪪 **Hermes:**";
 
@@ -117,6 +118,23 @@ export function formatEscalation(state: ProjectState, reason: string): string {
   ].join("\n");
 }
 
+/**
+ * When `state.timer` is set, render a one-line countdown summary for the
+ * status embed. Three states:
+ *  - Active (expiresAt > now): `⏱ Timer: 29:30 remaining (auto, 30m)`
+ *  - Expired but not yet collected (expiresAt <= now, still present in
+ *    state): `⏱ Timer: expired (will stop at next judge pass)`
+ *  - No timer / cleared: undefined → caller omits the line.
+ */
+function formatTimerLine(state: ProjectState): string | undefined {
+  if (!state.timer) return undefined;
+  const remainingMs = state.timer.expiresAt - Date.now();
+  if (remainingMs > 0) {
+    return `⏱ Timer: ${formatCountdown(remainingMs)} remaining (${state.mode}, ${state.timer.requestedDuration})`;
+  }
+  return `⏱ Timer: expired (will stop at next judge pass)`;
+}
+
 export function formatStatusEmbed(state: ProjectState): string {
   const done = state.plan.filter((t) => t.status === "done").length;
   const failed = state.plan.filter((t) => t.status === "failed").length;
@@ -125,13 +143,20 @@ export function formatStatusEmbed(state: ProjectState): string {
   const elapsed = Math.round(
     (Date.now() - new Date(state.startedAt).getTime()) / 60000,
   );
-  return [
+  const timerLine = formatTimerLine(state);
+  const lines: string[] = [
     `📊 **Project status: ${state.id.slice(0, 8)}**`,
     `Status: \`${state.status}\` | Mode: \`${state.mode}\``,
+  ];
+  if (timerLine) {
+    lines.push(timerLine);
+  }
+  lines.push(
     `Tasks: ${done} done, ${inProg} in progress, ${pending} pending, ${failed} failed (${state.plan.length} total)`,
     `Cost: $${(state.costUsd / 100).toFixed(2)} / $${(state.config.maxCostUsd / 100).toFixed(2)} | Iterations: ${state.iterations} / ${state.config.maxIterations} | Elapsed: ${elapsed} min / ${state.config.maxWallHours}h`,
     `Workspace: \`${state.repoPath}\``,
-  ].join("\n");
+  );
+  return lines.join("\n");
 }
 
 function formatDuration(ms: number): string {
