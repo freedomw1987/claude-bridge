@@ -28,7 +28,14 @@ import { runViaSdk } from "../../agent/sdkRunner";
 import type { SessionStore } from "../../db";
 import { splitForDiscord, DISCORD_MAX } from "../split";
 import { SendQueue } from "../sendQueue";
-import { truncate, stripThinkTags, containsQuestion, formatToolUse, TOOL_ICON } from "./format";
+import {
+  truncate,
+  stripThinkTags,
+  containsQuestion,
+  formatToolUse,
+  formatToolResult,
+  TOOL_ICON,
+} from "./format";
 
 /**
  * Prefix applied to every Claude Code reply posted to a thread (UX-3).
@@ -448,17 +455,21 @@ async function runViaClaudeCli(
           lastActivity = detail ? `${icon} ${name}: ${detail}` : `${icon} ${name}`;
         },
         onToolResult: (text, isError) => {
-          // Attach result to the most recent tool_use
+          // Attach a truncated preview to the most recent tool_use
+          // (the status banner shows last 4 calls; preview is bounded
+          // to 500 chars so the banner never overflows).
           const last = toolUses[toolUses.length - 1];
           if (last) {
-            last.result = text.slice(0, 500);
+            last.result = text.length > 500 ? text.slice(0, 499) + "…" : text;
             last.resultErr = isError;
           }
-          // Show a brief result preview
-          const preview = text.split("\n").slice(0, 3).join(" ").slice(0, 200);
-          lastActivity = isError
-            ? `❌ tool error: ${preview}${text.length > 200 ? "…" : ""}`
-            : `✓ result: ${preview}${text.length > 200 ? "…" : ""}`;
+          // Update lastActivity with a collapsed first-line preview.
+          // formatToolResult collapses all whitespace (incl. \n) into
+          // single spaces — multi-line tool outputs no longer push
+          // the rest of the banner out of the 1500-char truncate.
+          const preview = formatToolResult(text, isError);
+          const badge = isError ? "❌ tool error" : "✓ result";
+          lastActivity = preview ? `${badge}: ${preview}` : badge;
         },
         onUserText: (text) => {
           // user text from tool_result (when result is text-only)

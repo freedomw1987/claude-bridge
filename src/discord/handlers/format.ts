@@ -138,6 +138,33 @@ export function formatToolUse(name: string, input: unknown): string {
 }
 
 /**
+ * Format a tool_result for the streaming placeholder's recent-activity line.
+ *
+ * Strategy:
+ *  - Take the FIRST meaningful line of the result (skip blank / pure-whitespace).
+ *  - Collapse newlines into spaces so a multi-line tool output doesn't push
+ *    the rest of the status banner out of the 1500-char truncate.
+ *  - Truncate to `max` chars (default 200) with a trailing ellipsis.
+ *  - Prefix with ❌ when `isError` so failures stand out in the log.
+ *
+ * Returns an empty string if the result is empty / blank — caller can
+ * fall back to a generic "ok" message if desired.
+ */
+export function formatToolResult(
+  text: string,
+  isError: boolean,
+  max = 200,
+): string {
+  if (!text) return "";
+  // Collapse all whitespace (newlines, tabs, multi-spaces) into single spaces.
+  // Long tool outputs (e.g. a 50-line file dump) compress to one readable line.
+  const collapsed = text.replace(/\s+/g, " ").trim();
+  if (!collapsed) return "";
+  const head = collapsed.length <= max ? collapsed : collapsed.slice(0, max - 1) + "…";
+  return isError ? `❌ ${head}` : head;
+}
+
+/**
  * Tool icon for the recent-activity line in the streaming placeholder.
  */
 export const TOOL_ICON: Record<string, string> = {

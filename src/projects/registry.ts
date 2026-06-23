@@ -14,6 +14,12 @@
  *   a. exact alias from projects.json (with explicit override)
  *   b. exact subdirectory name under PROJECTS_ROOT
  *   c. otherwise: not found (caller can fall through to ad-hoc path)
+ *
+ * Scan results are cached in-memory with a TTL (default 60s) so that
+ * bursts of `@bot` mentions — each of which calls `list()` / `resolve()` —
+ * don't re-stat every project on every keystroke. The cache is
+ * invalidated explicitly via `invalidate()` (e.g. after creating a new
+ * project) or implicitly when the TTL expires.
  */
 
 import { existsSync, readdirSync, statSync, readFileSync } from "node:fs";
@@ -45,8 +51,19 @@ export class ProjectRegistry {
   private hidden = new Set<string>();
   private configPath: string | null;
   private config: ProjectsConfig | null = null;
+  private lastScanAt = 0;
+  private scanCount = 0;
 
-  constructor(opts: { root: string; configPath?: string }) {
+  constructor(
+    opts: { root: string; configPath?: string },
+    /**
+     * Cache TTL in milliseconds. After this many ms since `lastScanAt`,
+     * the next `resolve()` / `list()` / `newProjectPath()`-after-list
+     * triggers a fresh scan. Set to 0 to disable caching entirely
+     * (each call rescans — useful for tests). Default 60s.
+     */
+    private ttlMs: number = 60_000,
+  ) {
     this.root = expandTilde(opts.root);
     this.configPath = opts.configPath
       ? expandTilde(opts.configPath)
@@ -115,10 +132,13 @@ export class ProjectRegistry {
           });
           scanned++;
         }
+        this.lastScanAt = Date.now();
+        this.scanCount += 1;
         log.info("scanned projects root", {
           root: this.root,
           scanned,
           total: this.byName.size,
+          scanCount: this.scanCount,
         });
       } catch (err) {
         log.warn("failed to scan projects root", {
@@ -131,13 +151,52 @@ export class ProjectRegistry {
     }
   }
 
+  /**
+   * Force-clear the cache so the next resolve/list re-scans.
+   * Call this after creating a new project (so `@bot new foo` is
+   * immediately resolvable) or after manually editing projects.json.
+   */
+  invalidate(): void {
+    this.lastScanAt = 0;
+  }
+
+  /**
+   * Internal: re-scan only if the TTL has elapsed since the last scan.
+   * When ttlMs is 0 (tests), always re-scan. Safe to call from any
+   * read accessor — the work is a no-op when the cache is warm.
+   */
+  private ensureFresh(): void {
+    if (this.ttlMs === 0) {
+      this.reload();
+      return;
+    }
+    const now = Date.now();
+    if (now - this.lastScanAt >= this.ttlMs) {
+      this.reload();
+    }
+  }
+
+  /**
+   * Diagnostics: how many scans have happened and when the last one ran.
+   * Used by tests + future ops dashboards.
+   */
+  cacheStats(): { scanCount: number; ageMs: number; ttlMs: number } {
+    return {
+      scanCount: this.scanCount,
+      ageMs: this.lastScanAt === 0 ? Infinity : Date.now() - this.lastScanAt,
+      ttlMs: this.ttlMs,
+    };
+  }
+
   /** Look up a project by name. Case-insensitive. */
   resolve(name: string): ProjectEntry | null {
+    this.ensureFresh();
     return this.byName.get(name.toLowerCase()) ?? null;
   }
 
   /** List all projects, sorted by name. */
   list(opts: { includeHidden?: boolean } = {}): ProjectEntry[] {
+    this.ensureFresh();
     const all = [...this.byName.values()];
     const filtered = opts.includeHidden
       ? all
