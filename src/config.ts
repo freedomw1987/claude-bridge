@@ -98,6 +98,16 @@ export const config = {
     // planner LLM call legitimately needs > 5min. Default raised to
     // 15 minutes. Override via HERMES_PLANNER_TIMEOUT_MS (in ms).
     plannerTimeoutMs: optionalInt("HERMES_PLANNER_TIMEOUT_MS", 15 * 60 * 1000),
+    // RG-011: judge LLM call timeout (mirrors plannerTimeoutMs).
+    // Was hardcoded to 3min in src/hermes/judge.ts, which was too
+    // tight for haiku-4-5 judging large codebases (e.g. projects
+    // with >10 tasks to assess). Default raised to 5min; override
+    // via HERMES_JUDGE_TIMEOUT_MS (in ms). When exceeded, the judge
+    // throws JudgeTimeoutError → orchestrator catches and sets
+    // status="judge_timed_out" with a clean escalation message
+    // (was previously the opaque "Claude Code process aborted by
+    // user" string, RG-011 regression 2026-06-24).
+    judgeTimeoutMs: optionalInt("HERMES_JUDGE_TIMEOUT_MS", 5 * 60 * 1000),
     // When non-empty, resume any active projects on bot startup. Set to 0
     // to disable auto-resume (manual /project resume only).
     resumeOnStartup: optional("HERMES_RESUME_ON_STARTUP", "1") === "1",

@@ -36,7 +36,9 @@ export type ProjectStatus =
   | "failed"
   | "killed"
   | "timed_out" // RG-008: planner LLM call exceeded plannerTimeoutMs (default 15min)
-  | "parse_error"; // RG-010: planner returned output that didn't parse as JSON (e.g. leaked thinking tags)
+  | "parse_error" // RG-010: planner returned output that didn't parse as JSON (e.g. leaked thinking tags)
+  | "judge_timed_out" // RG-011: judge LLM call exceeded judgeTimeoutMs (default 5min)
+  | "judge_parse_error"; // RG-011: judge returned output that didn't parse as JSON (e.g. leaked thinking tags, malformed regex IDs)
 
 /**
  * Sub-reason for `killed` status. The base state machine has 3 terminal

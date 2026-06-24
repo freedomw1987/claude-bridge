@@ -32,7 +32,7 @@ import {
   PlannerTimeoutError,
   planProject,
 } from "./planner";
-import { judgeProject } from "./judge";
+import { JudgeParseError, JudgeTimeoutError, judgeProject } from "./judge";
 import {
   appendJournal,
   clearTimer,
@@ -248,34 +248,61 @@ export async function runProject(
     // status. Without this, the project would land on the generic
     // `failed` state with the same opaque "planner: invalid JSON
     // response: SyntaxError: Unrecognized token '<'" message.
+    //
+    // RG-011: mirror the above for the JUDGE. Pre-RG-011, the judge
+    // surfaced both opaque errors the user reported:
+    //   - judge timeout → "Claude Code process aborted by user" (SDK
+    //     string the orchestrator couldn't classify)
+    //   - judge parse failure → "judge: invalid JSON response: ..." with
+    //     Zod regex issues from the strict `^t\d+$` task-id regex
+    // Now both map to dedicated statuses (judge_timed_out / judge_parse_error)
+    // with friendly escalation messages and structured journal entries.
+    // Order matters: JudgeParseError must be checked before the generic
+    // Error fallback (and after JudgeTimeoutError, since they are siblings).
     const isPlannerTimeout = err instanceof PlannerTimeoutError;
     const isPlannerParseError = err instanceof PlannerParseError;
+    const isJudgeTimeout = err instanceof JudgeTimeoutError;
+    const isJudgeParseError = err instanceof JudgeParseError;
     state.status = isPlannerTimeout
       ? "timed_out"
       : isPlannerParseError
       ? "parse_error"
+      : isJudgeTimeout
+      ? "judge_timed_out"
+      : isJudgeParseError
+      ? "judge_parse_error"
       : "failed";
     state.endedAt = new Date().toISOString();
     saveState(deps.hermesDir, projectId, state);
     // Preserve the raw LLM output in the journal so the failure
     // is debuggable from the project thread without re-running
-    // the planner. Cap at 500 chars to keep the journal readable.
-    const rawSnippet =
-      isPlannerParseError && err instanceof PlannerParseError
-        ? err.raw.slice(0, 500)
-        : null;
+    // the planner/judge. Cap at 500 chars to keep the journal readable.
+    const rawSnippet = (isPlannerParseError && err instanceof PlannerParseError)
+      || (isJudgeParseError && err instanceof JudgeParseError)
+      ? (isPlannerParseError
+          ? (err as PlannerParseError).raw.slice(0, 500)
+          : (err as JudgeParseError).raw.slice(0, 500))
+      : null;
     appendJournal(deps.hermesDir, projectId, {
       type: "escalate",
       message: isPlannerTimeout
         ? `planner timed out after ${Math.round((err as PlannerTimeoutError).timeoutMs / 1000)}s; project ${state.id.slice(0, 8)} ended in timed_out`
         : isPlannerParseError
         ? `planner output was unparseable as JSON; project ${state.id.slice(0, 8)} ended in parse_error. raw=${JSON.stringify(rawSnippet)}`
+        : isJudgeTimeout
+        ? `judge timed out after ${Math.round((err as JudgeTimeoutError).timeoutMs / 1000)}s; project ${state.id.slice(0, 8)} ended in judge_timed_out`
+        : isJudgeParseError
+        ? `judge output was unparseable as JSON; project ${state.id.slice(0, 8)} ended in judge_parse_error. raw=${JSON.stringify(rawSnippet)}`
         : `orchestrator crash: ${String(err).slice(0, 300)}`,
     });
     const escalationMsg = isPlannerTimeout
       ? `🕐 planner timed out after ${Math.round((err as PlannerTimeoutError).timeoutMs / 1000)}s — goal was too complex for the planner LLM. Try /project resume with HERMES_PLANNER_TIMEOUT_MS raised, or split the goal.`
       : isPlannerParseError
       ? `🔧 planner output was unparseable as JSON — the LLM leaked thinking tags or returned malformed JSON. The raw output is in the project journal for inspection. Try /project resume to retry the planner, or simplify the goal.`
+      : isJudgeTimeout
+      ? `🕐 judge timed out after ${Math.round((err as JudgeTimeoutError).timeoutMs / 1000)}s — the judge LLM took too long to assess the project. Try /project resume to retry the judge.`
+      : isJudgeParseError
+      ? `🔧 judge output was unparseable as JSON — the LLM leaked thinking tags or returned malformed JSON. The raw output is in the project journal for inspection. Try /project resume to retry the judge.`
       : `orchestrator crashed: ${String(err).slice(0, 200)}`;
     await send(formatEscalation(state, escalationMsg));
   } finally {
