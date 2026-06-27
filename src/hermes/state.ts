@@ -55,8 +55,7 @@ import {
  */
 export function stripTimerHandle(state: ProjectState): ProjectState {
   if (!state.timer) return state;
-  const { handle: _h, ...persistable } = state.timer;
-  void _h; // explicitly discarded
+  const { handle: _, ...persistable } = state.timer;
   return { ...state, timer: persistable };
 }
 
@@ -67,9 +66,7 @@ export function stripTimerHandle(state: ProjectState): ProjectState {
  */
 export function clearTimer(state: ProjectState): ProjectState {
   if (!state.timer) return state;
-  // Drop the field entirely (don't leave a handle-less timer behind).
-  const { timer: _t, ...without } = state;
-  void _t;
+  const { timer: _, ...without } = state;
   return without as ProjectState;
 }
 
@@ -149,8 +146,7 @@ export function loadState(
     // loaded one (older buggy snapshot?), drop it. Re-arming the timer is
     // the caller's job (see index.ts:resumeActiveProjects).
     if (parsed.timer?.handle !== undefined) {
-      const { handle: _h, ...timerNoHandle } = parsed.timer;
-      void _h;
+      const { handle: _, ...timerNoHandle } = parsed.timer;
       parsed.timer = timerNoHandle as ProjectTimer;
     }
     return parsed;

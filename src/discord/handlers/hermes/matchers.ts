@@ -13,17 +13,11 @@
 
 import type { Message } from "discord.js";
 import type { ProjectMode } from "../../../hermes/types";
+import { stripMention } from "../../stripMention";
 
-/**
- * Strip Discord `<@userId>` mention prefixes. Hermes commands work both
- * with and without a leading @bot mention (e.g. `/project list` or
- * `@bot /project start "..."`). Without stripping, parseMention in the
- * legacy flow interprets `/project` as a local path because it starts
- * with `/`.
- */
-export function stripMention(content: string): string {
-  return content.trim().replace(/<@!?\d+>\s*/g, "").trim();
-}
+// Re-export so the existing `import { stripMention } from ".../hermes/matchers"`
+// call sites in hermesCommands.ts continue to work.
+export { stripMention };
 
 export const isProjectCommand = (content: string): boolean =>
   /^\/project\b/i.test(stripMention(content));

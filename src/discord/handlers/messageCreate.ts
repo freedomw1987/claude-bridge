@@ -36,6 +36,7 @@ import {
 } from "./hermesCommands";
 import { ensureRepoReady } from "./targets";
 import { forwardToClaude } from "./streaming";
+import { stripMention } from "../stripMention";
 
 interface HandlerDeps {
   store: SessionStore;
@@ -104,7 +105,7 @@ export async function handleMessageCreate(
   // so users can invoke Hermes either way (phone previews often include
   // the mention automatically). Without this, the legacy parseMention
   // flow would see "/project" as a path because it starts with "/".
-  const mentionStripped = msg.content.trim().replace(/<@!?\d+>\s*/g, "").trim();
+  const mentionStripped = stripMention(msg.content);
   if (/^\/project\b/i.test(mentionStripped)) {
     const handled = await dispatchHermesCommand(mentionStripped, {
       msg,
