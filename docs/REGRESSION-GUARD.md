@@ -13,6 +13,7 @@
 | RG-008 | Planner 5min hardcoded timeout + `/project kill` missing `killedReason` + planner crash → opaque "aborted by user" | 2026-06-22 | pre-fix | [see](#rg-008) | `src/discord/handlers/hermesCommands.test.ts` (10) + `src/hermes/orchestratorRG008.test.ts` (2) | FIXED |
 | RG-009 | `/project delete` 缺失 — 9 個 failed/killed projects 無法清理, 只能 `rm -rf` | 2026-06-22 | pre-fix | [see](#rg-009) | `src/discord/handlers/hermesCommandsRG009.test.ts` (15 tests) | FIXED |
 | RG-010 | planner `stripCodeFences` 唔 strip think tags → `JSON.parse` 撞 `<` → opaque "Unrecognized token" | 2026-06-22 | pre-fix | [see](#rg-010) | `src/hermes/plannerRG010.test.ts` (11) + `src/hermes/orchestratorRG008.test.ts` (2) | FIXED |
+| RG-012 | MCP tool handlers (`discord_send` / `discord_typing` / `discord_react` / `discord_read_history`) 透過 module-level mutable binding `setDiscordToolDeps()` 路由 → 兩個 SDK run 並發時 CC 嘅 reply 送到錯 thread | 2026-06-27 | pre-fix | [see](#rg-012) | `src/agent/discordTool.test.ts` RG-012 race block (4 tests) | FIXED |
 
 ---
 
@@ -763,3 +764,142 @@ JSON.parse(cleaned)  // 撞 `<` 死
 ### 相關 Discussion
 - 2026-06-22 David 揀 B = "RG-009 + RG-010 同步修, 1 個 commit ship" — 兩個 issue 互 independent, ship 埋一齊可以 1 個 restart 解決
 - 2026-06-22 80555888 嘅 9/10 execution crash 唔係 RG-010 真兇(planner 嗰 9 個 task 已經成功 plan 出嚟),係另一個 execution phase bug, **out of scope** 喺呢個 PR
+
+---
+
+<a id="rg-012"></a>
+## RG-012: MCP tool handlers race on module-level mutable `deps` (2026-06-27)
+
+**發現日期**: 2026-06-27
+**發現者**: @David (production report: two threads, CC reply sent to wrong thread)
+**影響版本**: v2.0.0 pre-fix (shipped 2026-06-25, regression introduced with SDK runner migration)
+
+### Incident
+David 喺 production 開咗兩個 Discord thread, 每個 thread 各用 `/project start` 開一個 Hermes auto-mode project 跑兩個唔同嘅項目。 兩個 thread 嘅 CC SDK run 同時 in-flight 期間, 其中一個 thread 嘅 Claude 呼叫 `discord_send` 時, 訊息送到咗另一個 thread。 用戶嘅描述: "我發現有一個問題, 當我同時在兩個 discord thread 去做兩個不同項目去開發時, 他回覆時會搞亂了 send 錯 discord thread"。
+
+### Root cause
+
+`src/agent/discordTool.ts` 用咗 module-level mutable binding 將 per-run 嘅 Discord `thread` 同 `send` 注入到 4 個 MCP tool handler (`discord_send` / `discord_typing` / `discord_react` / `discord_read_history`):
+
+```typescript
+// pre-RG-012 (broken):
+let deps: DiscordToolDeps;                              // module-level mutable
+export function setDiscordToolDeps(d: DiscordToolDeps) { deps = d; }
+// ... handler reads `deps.thread.sendTyping()` / `deps.send(content)`
+```
+
+每個 `runViaSdk` call 喺開頭執行 `setDiscordToolDeps({ thread, send })` 將當前 run 嘅 deps 寫入呢個 module-level slot。 當兩個 SDK run 並發:
+
+1. Run A 啟動 → `setDiscordToolDeps({ thread: A, send: A })` → `deps = {A}`
+2. Run B 啟動 → `setDiscordToolDeps({ thread: B, send: B })` → `deps = {B}` ← **覆蓋 A**
+3. Run A 嘅 Claude 觸發 `mcp__discord-bridge__discord_send` → handler 讀 `deps.send(...)` → 訊息送到 thread B ❌
+
+Module 註解 (`discordTool.ts:228-230`) 嘅「單一 Discord run per thread」假設**錯誤** — `MAX_CONCURRENT_CONTAINERS=5` (`config.ts:45`) 限制嘅係**全 bot 總共** 5 個 run, 唔係每 thread 1 個。 所以兩個 thread 各 1 個 run 完全合法, 但 `deps` slot 只有 1 個。
+
+### 影響範圍
+
+| 路徑 | Routing 機制 | 跨 thread 安全? |
+|------|------------|----------------|
+| `runViaSdk` 嘅 auto-post text loop (stream chunk) | 區域變數 `send` closure | ✅ 安全 |
+| Hermes metadata 訊息 (`🪪 Hermes:`) | `deps.thread` closure | ✅ 安全 |
+| `makeClaudeSend(deps.thread)` wrapper | per-task closure | ✅ 安全 |
+| `deps.thread.send(...)` direct call | per-call closure | ✅ 安全 |
+| **`mcp__discord-bridge__discord_send`** | **module-level `deps`** | ❌ **會送錯 thread** |
+| **`mcp__discord-bridge__discord_typing`** | **module-level `deps`** | ❌ 會送錯 thread |
+| **`mcp__discord-bridge__discord_react`** | **module-level `deps`** | ❌ 會 react 錯 thread |
+| **`mcp__discord-bridge__discord_read_history`** | **module-level `deps`** | ❌ 會讀錯 thread history |
+
+**Visible impact**: Auto-mode Hermes projects 同時跑時, CC 嘅 `discord_send` reply 會 send 到最後一個 `setDiscordToolDeps()` call 對應嘅 thread, 而非原本發出嘅 thread。 用戶睇到嘅現象係「project A 嘅 reply 出現喺 project B 嘅 thread 入面」。
+
+### Fix
+
+**Per-run factory pattern** — 將 module-level mutable 換成 per-run closure-captured tools。 每次 `runViaSdk` 自己嘅 MCP server 用自己 factory-built 嘅 tool set:
+
+```typescript
+// src/agent/discordTool.ts (RG-012 fix):
+export function createDiscordSendTool(deps: DiscordToolDeps): SdkMcpToolDefinition<...> {
+  return tool("discord_send", "...", schema, async (input, _extra) => {
+    // closure captures `deps` at factory-call time, not module-load time
+    const target = await deps.thread.messages.fetch(...);
+    msg = await deps.send(content);
+    ...
+  });
+}
+// + createDiscordTypingTool / createDiscordReactTool / createDiscordReadHistoryTool
+
+export function createDiscordTools(deps: DiscordToolDeps): SdkMcpToolDefinition<any>[] {
+  return [
+    createDiscordSendTool(deps),
+    createDiscordTypingTool(deps),
+    createDiscordReactTool(deps),
+    createDiscordReadHistoryTool(deps),
+  ];
+}
+```
+
+```typescript
+// src/agent/sdkRunner.ts (RG-012 fix):
+const deps: DiscordToolDeps = { thread, send };
+const tools = createDiscordTools(deps);   // ← per-run, closure-bound
+const mcpServer = createSdkMcpServer({
+  name: DISCORD_MCP_SERVER_NAME,
+  tools,                                   // ← not the old `allDiscordTools`
+});
+```
+
+**點解呢個 fix 安全**:
+- 每個 MCP server (已 per-run fresh create, 無改) 帶自己 closure-captured 嘅 tool set
+- JS 嘅 lexical scoping 保證 handler 永遠 read 自己 factory 時嘅 `deps`, 唔需要任何 external sync / lock / per-thread Map lookup
+- 完全冇 shared mutable state — `setDiscordToolDeps` 連同 `let deps` 一齊刪走
+- `MAX_CONCURRENT_CONTAINERS` 行為唔變, 仲係 global cap = 5
+
+**Cost**:
+- 每次 run 多 4 個 `tool()` factory call (cheap — in-process)
+- Test machinery 由 `setDiscordToolDeps({...})` + 直接 import tool 改成 `createDiscordTools({...})[N]` (mechanical, 14 個 test 全部 update)
+
+### Invariants Locked (4)
+
+| # | Invariant | Lock test |
+|---|-----------|-----------|
+| I-1 | `discord_send` from 2 concurrent tool sets routes ONLY to its own thread (interleaved 50 calls, 25 per side, via `Promise.all`) | `discordTool.test.ts` RG-012 "discord_send from 2 concurrent tool sets routes to the correct thread" |
+| I-2 | `discord_typing` from 2 concurrent tool sets hits the right thread (counted: 3 to A + 2 to B, no cross-leak) | `discordTool.test.ts` RG-012 "discord_typing from 2 concurrent tool sets hits the right thread" |
+| I-3 | `discord_react` from 2 concurrent tool sets reacts in the right thread (✅ only on thread A, ❌ only on thread B) | `discordTool.test.ts` RG-012 "discord_react from 2 concurrent tool sets reacts in the right thread" |
+| I-4 | `discord_read_history` from 2 concurrent tool sets reads the right thread (different message IDs per side) | `discordTool.test.ts` RG-012 "discord_read_history from 2 concurrent tool sets reads the right thread" |
+
+**Test failure mode**: 如果有人 revert 返做 module-level `setDiscordToolDeps()`, RG-012 I-1 嘅 `Promise.all` 跑緊期間 `deps` 會被另一個 setter call 覆蓋, 結果 `sentToA` 會 leak `B-0..24` 嘅 entry 落去 `sentToB`, 斷言 `every((c) => c.startsWith("B-"))` 會 fail。 即係話呢 4 個 race test 會 catch 到 RG-012 嘅 regression。
+
+### 防止再發
+
+- [x] **`createDiscordTools(deps)` factory** 完全取代 `setDiscordToolDeps()` + `allDiscordTools` module-level 模式
+- [x] **Module-level `let deps` variable 刪走** — 冇 fallback path, 任何 revert 都會破壞 compile
+- [x] **`allDiscordTools` export 刪走** — 任何外部 import 會觸發 TypeScript error
+- [x] **4 RG-012 race tests** 喺 `src/agent/discordTool.test.ts` 全部 PASS (interleaved concurrent calls 唔會 cross-contaminate)
+- [x] **`src/agent/sdkRunner.ts`** header comment 改述, 明確講 "concurrent runs on different threads cannot cross-contaminate (RG-012)"
+- [x] **`docs/ARCHITECTURE.md:249-254`** example code 改用 `createDiscordTools({ thread, send })`, 標明 RG-012 motivation
+
+### Detection signal (出現以下即 RG-012 走樣)
+
+- `src/agent/discordTool.ts` 出現 `let deps` / `setDiscordToolDeps` / `module-level mutable` keyword — fix 退返 pre-RG-012 行為
+- `src/agent/sdkRunner.ts` 用返 `tools: allDiscordTools` — 冇用新 factory
+- `createDiscordTools` 內部用 `let` capture 外部 variable 而唔係直接 closure `deps` — closure capture 失效
+- Race tests (I-1..I-4) 中 `sentToA.every((c) => c.startsWith("A-"))` 或同類斷言 fail — race 真係發生緊
+- `discordTool.test.ts` 重新引入 `beforeEach(() => setDiscordToolDeps({...}))` — module-level 隱性 contract 復活
+
+### Refactor Guard
+
+任何涉及 `src/agent/discordTool.ts` / `src/agent/sdkRunner.ts` / `src/agent/discordTool.test.ts` 嘅 refactor 必須:
+
+1. 跑 `bun test src/agent/discordTool.test.ts` 並確認 RG-012 嘅 4 個 race test 全部 PASS (I-1..I-4)
+2. 跑 `bunx tsc --noEmit` 確認 typecheck clean — `setDiscordToolDeps` / `allDiscordTools` import 應該 type error
+3. 確認 `createDiscordTools(deps)` 仍然係 per-run factory, 每個 tool handler closure 直接 capture 入面嘅 `deps` (唔 capture 外部 mutable)
+
+### 相關 Discussion
+
+- 2026-06-27 David 喺 production 撞到呢個 race, 形容為「兩個 thread 嘅 CC reply 搞亂 send」, 屬於 user-visible bug
+- Fix 選擇 discussion:
+  - **Option A (採用)**: Factory pattern, 每個 run 自己 build tool set, closure 隔離 — 簡單, 零 shared state
+  - **Option B (rejected)**: 將 `setDiscordToolDeps` 改做 `Map<threadId, DiscordToolDeps>`, handler 入面用 context lookup — 需要 SDK 提供 thread context, Anthropic SDK 而家冇
+  - **Option C (rejected)**: 加 mutex serialize `setDiscordToolDeps` + handler call — 會把 SDK run 串行化, 等於將並發退化成單 thread, 違背 `MAX_CONCURRENT_CONTAINERS` 嘅設計原意
+- Hermes metadata 訊息 (`🪪 Hermes:`) 同 `runViaSdk` auto-post text 而家已經 closure-captured, 唔受影響 — 確認係只有 MCP tool handlers 受影響
+- CLI runner (`src/agent/runner.ts`) 唔用 MCP tools, 完全唔受影響 — out of scope
+

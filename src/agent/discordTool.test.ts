@@ -1,21 +1,16 @@
 /**
  * Tests for the four Discord tools exposed to Claude Code via MCP.
  *
- * The `tool()` factory from the SDK builds handler closures that read
- * `deps` via a module-level binding (setDiscordToolDeps). We set the
- * deps before each test, call the handler directly with various inputs,
- * and assert on the returned CallToolResult.
+ * The `tool()` factory from the SDK builds handler closures. We use the
+ * RG-012 factory pattern (`createDiscordTools(deps)`) so each test gets
+ * a tool set whose handlers close over the test's specific `deps`. No
+ * module-level mutable binding — tests are independent and can be run
+ * concurrently (see the RG-012 describe block at the bottom).
  */
 
-import { describe, it, expect, beforeEach, mock } from "bun:test";
+import { describe, it, expect, mock } from "bun:test";
 import type { Message, ThreadChannel, Collection } from "discord.js";
-import {
-  discordSendTool,
-  discordTypingTool,
-  discordReactTool,
-  discordReadHistoryTool,
-  setDiscordToolDeps,
-} from "./discordTool";
+import { createDiscordTools } from "./discordTool";
 import { DISCORD_MAX } from "../discord/split";
 
 // ---- Minimal Discord.js mocks ----
@@ -80,9 +75,15 @@ function makeThread(opts: {
   return thread as unknown as ThreadChannel;
 }
 
-beforeEach(() => {
-  // Reset module-level deps for each test by setting fresh ones.
-});
+// Tool index mapping (stable, per RG-012 docs):
+//   0: discord_send
+//   1: discord_typing
+//   2: discord_react
+//   3: discord_read_history
+const TOOL_INDEX_SEND = 0;
+const TOOL_INDEX_TYPING = 1;
+const TOOL_INDEX_REACT = 2;
+const TOOL_INDEX_HISTORY = 3;
 
 // ---- discord_send ----
 
@@ -93,9 +94,9 @@ describe("discord_send tool", () => {
       // simulate SendQueue wrapper
       return thread.send(content);
     });
-    setDiscordToolDeps({ thread, send });
+    const tools = createDiscordTools({ thread, send });
 
-    const result = await (discordSendTool as any).handler(
+    const result = await (tools[TOOL_INDEX_SEND] as any).handler(
       { content: "hello world" },
       {},
     );
@@ -109,10 +110,10 @@ describe("discord_send tool", () => {
   it("rejects content over 1900 chars with isError result", async () => {
     const thread = makeThread({});
     const send = mock(async () => makeMsg());
-    setDiscordToolDeps({ thread, send });
+    const tools = createDiscordTools({ thread, send });
 
     const longContent = "x".repeat(1901);
-    const result = await (discordSendTool as any).handler(
+    const result = await (tools[TOOL_INDEX_SEND] as any).handler(
       { content: longContent },
       {},
     );
@@ -131,9 +132,9 @@ describe("discord_send tool", () => {
       },
     });
     const send = mock(async () => makeMsg());
-    setDiscordToolDeps({ thread, send });
+    const tools = createDiscordTools({ thread, send });
 
-    const result = await (discordSendTool as any).handler(
+    const result = await (tools[TOOL_INDEX_SEND] as any).handler(
       { content: "reply text", reply_to_message_id: "target-id" },
       {},
     );
@@ -151,9 +152,9 @@ describe("discord_send tool", () => {
     const send = mock(async (content: string) =>
       thread.send(content),
     );
-    setDiscordToolDeps({ thread, send });
+    const tools = createDiscordTools({ thread, send });
 
-    const result = await (discordSendTool as any).handler(
+    const result = await (tools[TOOL_INDEX_SEND] as any).handler(
       { content: "fallback", reply_to_message_id: "missing-id" },
       {},
     );
@@ -170,10 +171,10 @@ describe("discord_send tool", () => {
       sentContent = content;
       return thread.send(content);
     });
-    setDiscordToolDeps({ thread, send });
+    const tools = createDiscordTools({ thread, send });
 
     const raw = "<ant_thinking>\nLet me think about this carefully...\nThe user wants X.\n</ant_thinking>\n\nHere is the final answer: do X then Y.";
-    const result = await (discordSendTool as any).handler(
+    const result = await (tools[TOOL_INDEX_SEND] as any).handler(
       { content: raw },
       {},
     );
@@ -191,10 +192,10 @@ describe("discord_send tool", () => {
       sentContent = content;
       return thread.send(content);
     });
-    setDiscordToolDeps({ thread, send });
+    const tools = createDiscordTools({ thread, send });
 
     const raw = "<thinking>reasoning here</thinking>\nActual answer text.";
-    const result = await (discordSendTool as any).handler(
+    const result = await (tools[TOOL_INDEX_SEND] as any).handler(
       { content: raw },
       {},
     );
@@ -214,14 +215,14 @@ describe("discord_send tool", () => {
       sentContent = content;
       return thread.send(content);
     });
-    setDiscordToolDeps({ thread, send });
+    const tools = createDiscordTools({ thread, send });
 
     const thinking = "<ant_thinking>\n" + "x".repeat(1900) + "\n</ant_thinking>\n";
     const finalAnswer = "Final: short answer.";
     const raw = thinking + finalAnswer;
     expect(raw.length).toBeGreaterThan(DISCORD_MAX);
 
-    const result = await (discordSendTool as any).handler(
+    const result = await (tools[TOOL_INDEX_SEND] as any).handler(
       { content: raw },
       {},
     );
@@ -236,9 +237,9 @@ describe("discord_typing tool", () => {
   it("calls sendTyping on the thread", async () => {
     const thread = makeThread({});
     const send = mock(async () => makeMsg());
-    setDiscordToolDeps({ thread, send });
+    const tools = createDiscordTools({ thread, send });
 
-    const result = await (discordTypingTool as any).handler({}, {});
+    const result = await (tools[TOOL_INDEX_TYPING] as any).handler({}, {});
     expect(result.isError).toBeUndefined();
     expect(result.content[0].type).toBe("text");
     expect(JSON.parse(result.content[0].text)).toEqual({ ok: true });
@@ -252,9 +253,9 @@ describe("discord_typing tool", () => {
       },
     });
     const send = mock(async () => makeMsg());
-    setDiscordToolDeps({ thread, send });
+    const tools = createDiscordTools({ thread, send });
 
-    const result = await (discordTypingTool as any).handler({}, {});
+    const result = await (tools[TOOL_INDEX_TYPING] as any).handler({}, {});
     expect(result.isError).toBeUndefined();
     expect(JSON.parse(result.content[0].text)).toEqual({ ok: true });
   });
@@ -272,9 +273,9 @@ describe("discord_react tool", () => {
       },
     });
     const send = mock(async () => makeMsg());
-    setDiscordToolDeps({ thread, send });
+    const tools = createDiscordTools({ thread, send });
 
-    const result = await (discordReactTool as any).handler(
+    const result = await (tools[TOOL_INDEX_REACT] as any).handler(
       { message_id: "target-id", emoji: "✅" },
       {},
     );
@@ -291,9 +292,9 @@ describe("discord_react tool", () => {
       fetchOneImpl: async () => targetMsg,
     });
     const send = mock(async () => makeMsg());
-    setDiscordToolDeps({ thread, send });
+    const tools = createDiscordTools({ thread, send });
 
-    const result = await (discordReactTool as any).handler(
+    const result = await (tools[TOOL_INDEX_REACT] as any).handler(
       { message_id: "target-id", emoji: "✅" },
       {},
     );
@@ -335,9 +336,9 @@ describe("discord_read_history tool", () => {
       },
     });
     const send = mock(async () => makeMsg());
-    setDiscordToolDeps({ thread, send });
+    const tools = createDiscordTools({ thread, send });
 
-    const result = await (discordReadHistoryTool as any).handler({}, {});
+    const result = await (tools[TOOL_INDEX_HISTORY] as any).handler({}, {});
     expect(result.isError).toBeUndefined();
     const parsed = JSON.parse(result.content[0].text);
     expect(parsed.count).toBe(2);
@@ -355,12 +356,12 @@ describe("discord_read_history tool", () => {
       },
     });
     const send = mock(async () => makeMsg());
-    setDiscordToolDeps({ thread, send });
+    const tools = createDiscordTools({ thread, send });
 
     // limit=999 should be clamped to 100 by the tool schema, but at the
     // handler level we already passed schema validation. So this asserts
     // the handler trusts the input and the schema handles bounds.
-    await (discordReadHistoryTool as any).handler({ limit: 999 }, {});
+    await (tools[TOOL_INDEX_HISTORY] as any).handler({ limit: 999 }, {});
     expect(receivedLimit).toBe(999); // schema clamps, handler sees valid value
   });
 
@@ -373,9 +374,9 @@ describe("discord_read_history tool", () => {
       },
     });
     const send = mock(async () => makeMsg());
-    setDiscordToolDeps({ thread, send });
+    const tools = createDiscordTools({ thread, send });
 
-    await (discordReadHistoryTool as any).handler({}, {});
+    await (tools[TOOL_INDEX_HISTORY] as any).handler({}, {});
     expect(receivedLimit).toBe(50);
   });
 
@@ -386,10 +387,174 @@ describe("discord_read_history tool", () => {
       },
     });
     const send = mock(async () => makeMsg());
-    setDiscordToolDeps({ thread, send });
+    const tools = createDiscordTools({ thread, send });
 
-    const result = await (discordReadHistoryTool as any).handler({}, {});
+    const result = await (tools[TOOL_INDEX_HISTORY] as any).handler({}, {});
     expect(result.isError).toBe(true);
     expect(result.content[0].text).toContain("Missing Access");
+  });
+});
+
+// ---- RG-012: concurrent SDK runs must not cross-contaminate ----
+//
+// Regression guard for the 2026-06-27 incident where two threads running
+// CC SDK queries simultaneously would have CC's `discord_send` etc. routed
+// to the wrong thread (module-level `setDiscordToolDeps()` race).
+//
+// These tests use the factory pattern (`createDiscordTools(deps)`) to give
+// each "run" its own tool set whose handlers close over the specific
+// thread/send. If someone reverts to a module-level mutable binding, the
+// interleaved `Promise.all` calls will race and the assertions will fail:
+// the wrong `send` will be invoked, leaking cross-thread content.
+
+describe("RG-012 cross-thread isolation (concurrent runs)", () => {
+  it("discord_send from 2 concurrent tool sets routes to the correct thread", async () => {
+    const sentToA: string[] = [];
+    const sentToB: string[] = [];
+    const threadA = makeThread({});
+    const sendA = mock(async (c: string) => {
+      sentToA.push(c);
+      return makeMsg();
+    });
+    const threadB = makeThread({});
+    const sendB = mock(async (c: string) => {
+      sentToB.push(c);
+      return makeMsg();
+    });
+
+    const toolsA = createDiscordTools({ thread: threadA, send: sendA });
+    const toolsB = createDiscordTools({ thread: threadB, send: sendB });
+
+    // Interleave 25 calls on each side concurrently.
+    const promises: Promise<unknown>[] = [];
+    for (let i = 0; i < 25; i++) {
+      promises.push(
+        (toolsA[TOOL_INDEX_SEND] as any).handler({ content: `A-${i}` }, {}),
+      );
+      promises.push(
+        (toolsB[TOOL_INDEX_SEND] as any).handler({ content: `B-${i}` }, {}),
+      );
+    }
+    await Promise.all(promises);
+
+    // No cross-contamination: A handlers must ONLY have posted to sendA,
+    // and B handlers only to sendB. If `deps` is shared mutable state,
+    // some A-* content will appear in sentToB (or vice versa) and the
+    // `.every()` assertion fails.
+    expect(sentToA.length).toBe(25);
+    expect(sentToB.length).toBe(25);
+    expect(sentToA.every((c) => c.startsWith("A-"))).toBe(true);
+    expect(sentToB.every((c) => c.startsWith("B-"))).toBe(true);
+  });
+
+  it("discord_typing from 2 concurrent tool sets hits the right thread", async () => {
+    const typingA = mock(async () => undefined);
+    const typingB = mock(async () => undefined);
+    const threadA = { ...makeThread({}), sendTyping: typingA };
+    const threadB = { ...makeThread({}), sendTyping: typingB };
+
+    const toolsA = createDiscordTools({
+      thread: threadA as unknown as ThreadChannel,
+      send: mock(async () => makeMsg()),
+    });
+    const toolsB = createDiscordTools({
+      thread: threadB as unknown as ThreadChannel,
+      send: mock(async () => makeMsg()),
+    });
+
+    await Promise.all([
+      (toolsA[TOOL_INDEX_TYPING] as any).handler({}, {}),
+      (toolsB[TOOL_INDEX_TYPING] as any).handler({}, {}),
+      (toolsA[TOOL_INDEX_TYPING] as any).handler({}, {}),
+      (toolsB[TOOL_INDEX_TYPING] as any).handler({}, {}),
+      (toolsA[TOOL_INDEX_TYPING] as any).handler({}, {}),
+    ]);
+
+    expect(typingA).toHaveBeenCalledTimes(3);
+    expect(typingB).toHaveBeenCalledTimes(2);
+  });
+
+  it("discord_react from 2 concurrent tool sets reacts in the right thread", async () => {
+    const reactedA: string[] = [];
+    const reactedB: string[] = [];
+    const targetA = makeMsg({
+      id: "msg-a",
+      react: mock(async (e: string) => {
+        reactedA.push(e);
+      }),
+    });
+    const targetB = makeMsg({
+      id: "msg-b",
+      react: mock(async (e: string) => {
+        reactedB.push(e);
+      }),
+    });
+    const threadA = makeThread({
+      fetchOneImpl: async (id) => {
+        expect(id).toBe("msg-a");
+        return targetA;
+      },
+    });
+    const threadB = makeThread({
+      fetchOneImpl: async (id) => {
+        expect(id).toBe("msg-b");
+        return targetB;
+      },
+    });
+
+    const toolsA = createDiscordTools({
+      thread: threadA,
+      send: mock(async () => makeMsg()),
+    });
+    const toolsB = createDiscordTools({
+      thread: threadB,
+      send: mock(async () => makeMsg()),
+    });
+
+    await Promise.all([
+      (toolsA[TOOL_INDEX_REACT] as any).handler(
+        { message_id: "msg-a", emoji: "✅" },
+        {},
+      ),
+      (toolsB[TOOL_INDEX_REACT] as any).handler(
+        { message_id: "msg-b", emoji: "❌" },
+        {},
+      ),
+    ]);
+
+    expect(reactedA).toEqual(["✅"]);
+    expect(reactedB).toEqual(["❌"]);
+  });
+
+  it("discord_read_history from 2 concurrent tool sets reads the right thread", async () => {
+    const messagesA = new Map<string, Message>([
+      ["a1", makeMsg({ id: "a1", content: "from-A" })],
+    ]);
+    const messagesB = new Map<string, Message>([
+      ["b1", makeMsg({ id: "b1", content: "from-B" })],
+    ]);
+    const threadA = makeThread({
+      fetchImpl: async () => messagesA as unknown as Collection<string, Message>,
+    });
+    const threadB = makeThread({
+      fetchImpl: async () => messagesB as unknown as Collection<string, Message>,
+    });
+
+    const toolsA = createDiscordTools({
+      thread: threadA,
+      send: mock(async () => makeMsg()),
+    });
+    const toolsB = createDiscordTools({
+      thread: threadB,
+      send: mock(async () => makeMsg()),
+    });
+
+    const [resA, resB] = await Promise.all([
+      (toolsA[TOOL_INDEX_HISTORY] as any).handler({ limit: 50 }, {}),
+      (toolsB[TOOL_INDEX_HISTORY] as any).handler({ limit: 50 }, {}),
+    ]);
+
+    expect(JSON.parse(resA.content[0].text).messages[0].id).toBe("a1");
+    expect(JSON.parse(resB.content[0].text).messages[0].id).toBe("b1");
   });
 });

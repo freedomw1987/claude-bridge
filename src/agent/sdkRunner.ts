@@ -38,11 +38,7 @@ import { log } from "../logger";
 import { splitForDiscord, DISCORD_MAX } from "../discord/split";
 import { readSystemPrompt } from "./systemPrompt";
 import { stripThinkTags } from "../discord/handlers/format";
-import {
-  allDiscordTools,
-  setDiscordToolDeps,
-  type DiscordToolDeps,
-} from "./discordTool";
+import { createDiscordTools, type DiscordToolDeps } from "./discordTool";
 
 // Startup diagnostic: log the actual zod version the runtime is using.
 // The MCP SDK's zod-to-json-schema converter is zod-3 only. If this
@@ -127,9 +123,10 @@ export async function abortAllSdkRuns(): Promise<void> {
  * Run Claude Code against the given Discord thread, via the SDK.
  *
  * The thread + send wrapper are bound into the MCP tool handlers via
- * `setDiscordToolDeps()` before the run starts. Each run creates its own
- * MCP server instance (cheap — in-process), so concurrent runs do not
- * collide.
+ * `createDiscordTools(deps)` factory at the start of each run. Each
+ * tool handler closure captures its own `deps`, so concurrent runs
+ * on different threads cannot cross-contaminate (RG-012). Each run
+ * also creates its own MCP server instance (cheap — in-process).
  */
 export async function runViaSdk(
   userMsg: import("discord.js").Message,
@@ -144,16 +141,20 @@ export async function runViaSdk(
   // A raw `thread.send` / `channel.send` wrapper will fail to compile here.
   send: import("../discord/handlers/streaming").PrefixedSend,
 ): Promise<SdkRunResult> {
-  // Bind thread + send into the MCP tool handlers.
+  // Build the per-run MCP tool set. Each handler closure captures the
+  // per-run `deps` (thread + send) so concurrent SDK runs on different
+  // threads cannot cross-contaminate. See RG-012 in REGRESSION-GUARD.md
+  // — previously we used a module-level `setDiscordToolDeps()` binding
+  // which raced when two runs were in flight simultaneously.
   const deps: DiscordToolDeps = { thread, send };
-  setDiscordToolDeps(deps);
+  const tools = createDiscordTools(deps);
 
   const systemPrompt = await readSystemPrompt();
 
-  // Build the MCP server with our four tools.
+  // Build the MCP server with our four tools (already bound to this run).
   const mcpServer = createSdkMcpServer({
     name: DISCORD_MCP_SERVER_NAME,
-    tools: allDiscordTools,
+    tools,
   });
 
   const options: NonNullable<Parameters<typeof query>[0]["options"]> = {

@@ -12,16 +12,34 @@
  * CallToolResult is the MCP standard: { content: ContentBlock[], isError?: bool }
  * where ContentBlock is typically { type: "text", text: string }.
  *
- * Tool handlers have closure access to the Discord thread + SendQueue, so the
- * side effects (thread.send, thread.sendTyping, msg.react, thread.messages.fetch)
- * happen inline. The SDK dispatches each tool call to our handler and packages
- * the result back to Claude.
+ * ## RG-012 — per-run factory pattern (NOT module-level mutable)
+ *
+ * Each tool's `handler` closure captures the per-run `deps` (thread + send
+ * wrapper) at factory-call time. This is why we expose four
+ * `createXxxTool(deps)` factories plus an aggregate `createDiscordTools(deps)`
+ * factory instead of pre-built singletons.
+ *
+ * Why not pre-build the tools once at module load? Because then the handlers
+ * would need a *mutable* `deps` binding (e.g. `setDiscordToolDeps()`) — and
+ * that races across concurrent SDK runs: thread A starts a run, sets `deps`
+ * to threadA; thread B starts a run, sets `deps` to threadB and *overwrites*
+ * A's binding; thread A's Claude fires `discord_send` and the handler now
+ * posts to thread B. This was a real user-visible bug (2026-06-27, RG-012).
+ *
+ * With the factory pattern, each `runViaSdk` call creates its own MCP server
+ * with its own tool set, each handler closure bound to its own thread. No
+ * shared mutable state — isolation is enforced by JavaScript's lexical
+ * scoping, not by external synchronization.
  */
 
 import { z } from "zod";
 import type { Message, ThreadChannel } from "discord.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
-import { tool } from "@anthropic-ai/claude-agent-sdk";
+import {
+  tool,
+  type SdkMcpToolDefinition,
+  type AnyZodRawShape,
+} from "@anthropic-ai/claude-agent-sdk";
 import { log } from "../logger";
 import { truncate, stripThinkTags } from "../discord/handlers/format";
 
@@ -48,6 +66,11 @@ export interface DiscordToolDeps {
   send: (content: string) => Promise<Message>;
 }
 
+// ──────────────────────────────────────────────────────────────────────────
+// Per-tool factory functions. Each takes the per-run `deps` and returns
+// a fresh SdkMcpToolDefinition whose handler closure captures those deps.
+// ──────────────────────────────────────────────────────────────────────────
+
 /**
  * discord_send — post a message to the current thread.
  *
@@ -56,13 +79,13 @@ export interface DiscordToolDeps {
  * given and the target exists, we use `target.reply()` to highlight it;
  * otherwise we fall back to a plain `thread.send`.
  */
-export const discordSendTool = tool(
-  "discord_send",
-  "Send a message to the current Discord thread. Returns the new message ID. " +
-    "Content must be <= 1900 characters; if your reply is longer, split it into " +
-    "multiple calls (one per logical paragraph or section). Use \\n\\n for " +
-    "paragraph breaks. Prefer a single well-structured call over many tiny ones.",
-  {
+export function createDiscordSendTool(
+  deps: DiscordToolDeps,
+): SdkMcpToolDefinition<{
+  content: z.ZodString;
+  reply_to_message_id: z.ZodOptional<z.ZodString>;
+}> {
+  const schema = {
     content: z
       .string()
       .min(1)
@@ -72,97 +95,118 @@ export const discordSendTool = tool(
       .string()
       .optional()
       .describe("Optional: message ID to reply to (highlights it for the user)"),
-  },
-  async (input, _extra) => {
-    // RG-002: strip thinking-block tags BEFORE the length check and
-    // before posting. CC's content frequently wraps reasoning in
-    // <ant_thinking>...</ant_thinking> (or <thinking>...</thinking>
-    // for older models); if we don't strip, the user sees raw XML
-    // instead of CC's final answer. Stripping can also reduce the
-    // effective length, so a 2102-char raw CC reply with 1500 chars
-    // of thinking might legitimately fit in 1900 once stripped.
-    const rawContent = input.content;
-    const content = stripThinkTags(rawContent);
-    if (content !== rawContent) {
-      log.info("discord_send stripped thinking blocks", {
-        rawLength: rawContent.length,
-        strippedLength: content.length,
+  };
+  return tool(
+    "discord_send",
+    "Send a message to the current Discord thread. Returns the new message ID. " +
+      "Content must be <= 1900 characters; if your reply is longer, split it into " +
+      "multiple calls (one per logical paragraph or section). Use \\n\\n for " +
+      "paragraph breaks. Prefer a single well-structured call over many tiny ones.",
+    schema,
+    async (input, _extra) => {
+      // RG-002: strip thinking-block tags BEFORE the length check and
+      // before posting. CC's content frequently wraps reasoning in
+      // <ant_thinking>...</ant_thinking> (or <thinking>...</thinking>
+      // for older models); if we don't strip, the user sees raw XML
+      // instead of CC's final answer. Stripping can also reduce the
+      // effective length, so a 2102-char raw CC reply with 1500 chars
+      // of thinking might legitimately fit in 1900 once stripped.
+      const rawContent = input.content;
+      const content = stripThinkTags(rawContent);
+      if (content !== rawContent) {
+        log.info("discord_send stripped thinking blocks", {
+          rawLength: rawContent.length,
+          strippedLength: content.length,
+        });
+      }
+      log.info("discord_send called", {
+        contentLength: content.length,
+        hasReplyTarget: !!input.reply_to_message_id,
       });
-    }
-    log.info("discord_send called", {
-      contentLength: content.length,
-      hasReplyTarget: !!input.reply_to_message_id,
-    });
-    if (content.length > DISCORD_MAX) {
-      return errorResult(
-        `content is ${content.length} chars (max ${DISCORD_MAX}); split into multiple calls`,
-      );
-    }
-    let msg: Message;
-    if (input.reply_to_message_id) {
-      try {
-        const target = await deps.thread.messages.fetch(input.reply_to_message_id);
-        msg = await target.reply(content);
-      } catch {
+      if (content.length > DISCORD_MAX) {
+        return errorResult(
+          `content is ${content.length} chars (max ${DISCORD_MAX}); split into multiple calls`,
+        );
+      }
+      let msg: Message;
+      if (input.reply_to_message_id) {
+        try {
+          const target = await deps.thread.messages.fetch(input.reply_to_message_id);
+          msg = await target.reply(content);
+        } catch {
+          msg = await deps.send(content);
+        }
+      } else {
         msg = await deps.send(content);
       }
-    } else {
-      msg = await deps.send(content);
-    }
-    log.info("discord_send posted", { message_id: msg.id });
-    return textResult(
-      JSON.stringify({ message_id: msg.id, content_length: msg.content.length }),
-    );
-  },
-);
+      log.info("discord_send posted", { message_id: msg.id });
+      return textResult(
+        JSON.stringify({ message_id: msg.id, content_length: msg.content.length }),
+      );
+    },
+  );
+}
 
 /**
  * discord_typing — show the typing indicator for ~10s.
  * Call before long tool operations so the user knows work is in progress.
  */
-export const discordTypingTool = tool(
-  "discord_typing",
-  "Show the 'typing...' indicator on the thread for ~10 seconds. Call this " +
-    "before long operations (e.g., before a Bash command that takes a while, " +
-    "or before reading a large file) so the user knows the agent is still working. " +
-    "Safe to call multiple times — Discord refreshes the indicator.",
-  {},
-  async (_input, _extra) => {
-    try {
-      await deps.thread.sendTyping();
-    } catch {
-      // Best-effort; typing is ephemeral.
-    }
-    return textResult(JSON.stringify({ ok: true }));
-  },
-);
+export function createDiscordTypingTool(
+  deps: DiscordToolDeps,
+): SdkMcpToolDefinition<AnyZodRawShape> {
+  return tool(
+    "discord_typing",
+    "Show the 'typing...' indicator on the thread for ~10 seconds. Call this " +
+      "before long operations (e.g., before a Bash command that takes a while, " +
+      "or before reading a large file) so the user knows the agent is still working. " +
+      "Safe to call multiple times — Discord refreshes the indicator.",
+    {},
+    async (_input, _extra) => {
+      try {
+        await deps.thread.sendTyping();
+      } catch {
+        // Best-effort; typing is ephemeral.
+      }
+      return textResult(JSON.stringify({ ok: true }));
+    },
+  );
+}
 
 /**
  * discord_react — add an emoji reaction to a message in the thread.
  */
-export const discordReactTool = tool(
-  "discord_react",
-  "Add an emoji reaction to a message in the thread. " +
-    "Recommended usage: react to the user's original message with ✅ when " +
-    "you've successfully completed a task, ❌ on errors, ❓ when asking a " +
-    "question. Reactions are best-effort; missing permissions or unknown " +
-    "emojis are silently ignored.",
-  {
-    message_id: z.string().describe("ID of the message to react to"),
-    emoji: z
-      .string()
-      .describe("Emoji — Unicode (✅, ❌, ❓) or custom name:id (e.g. custom_emoji:123)"),
-  },
-  async (input, _extra) => {
-    try {
-      const target = await deps.thread.messages.fetch(input.message_id);
-      await target.react(input.emoji);
-      return textResult(JSON.stringify({ ok: true, message_id: input.message_id }));
-    } catch (err) {
-      return errorResult(`failed to react: ${truncate(String(err), 200)}`);
-    }
-  },
-);
+export function createDiscordReactTool(
+  deps: DiscordToolDeps,
+): SdkMcpToolDefinition<{
+  message_id: z.ZodString;
+  emoji: z.ZodString;
+}> {
+  return tool(
+    "discord_react",
+    "Add an emoji reaction to a message in the thread. " +
+      "Recommended usage: react to the user's original message with ✅ when " +
+      "you've successfully completed a task, ❌ on errors, ❓ when asking a " +
+      "question. Reactions are best-effort; missing permissions or unknown " +
+      "emojis are silently ignored.",
+    {
+      message_id: z.string().describe("ID of the message to react to"),
+      emoji: z
+        .string()
+        .describe(
+          "Emoji — Unicode (✅, ❌, ❓) or custom name:id (e.g. custom_emoji:123)",
+        ),
+    },
+    async (input, _extra) => {
+      try {
+        const target = await deps.thread.messages.fetch(input.message_id);
+        await target.react(input.emoji);
+        return textResult(JSON.stringify({ ok: true, message_id: input.message_id }));
+      } catch (err) {
+        return errorResult(`failed to react: ${truncate(String(err), 200)}`);
+      }
+    },
+  );
+}
 
 /**
  * discord_read_history — fetch recent messages from the current thread.
@@ -170,66 +214,70 @@ export const discordReactTool = tool(
  * beyond the user's most recent message (e.g., earlier messages in the thread,
  * other users' comments — though this bot currently only allows one user).
  */
-export const discordReadHistoryTool = tool(
-  "discord_read_history",
-  "Fetch recent messages from the current Discord thread (chronological order, " +
-    "oldest first). Useful when you need context beyond what the user just sent " +
-    "— for example, your own earlier messages, or other users' comments in the " +
-    "thread. Note: in this bot's setup, threads only contain messages from the " +
-    "same user, so this mostly gives you your own history.",
-  {
-    limit: z
-      .number()
-      .int()
-      .min(1)
-      .max(100)
-      .optional()
-      .describe("How many messages to return (default 50, max 100)"),
-  },
-  async (input, _extra) => {
-    const limit = input.limit ?? 50;
-    try {
-      const fetched = await deps.thread.messages.fetch({ limit });
-      const messages = [...fetched.values()]
-        .sort((a, b) => a.createdTimestamp - b.createdTimestamp)
-        .map((m) => ({
-          id: m.id,
-          author: m.author.username,
-          author_id: m.author.id,
-          is_bot: m.author.bot,
-          content: m.content,
-          timestamp: m.createdAt.toISOString(),
-        }));
-      return textResult(JSON.stringify({ count: messages.length, messages }));
-    } catch (err) {
-      return errorResult(`failed to read history: ${truncate(String(err), 200)}`);
-    }
-  },
-);
-
-export const allDiscordTools = [
-  discordSendTool,
-  discordTypingTool,
-  discordReactTool,
-  discordReadHistoryTool,
-];
+export function createDiscordReadHistoryTool(
+  deps: DiscordToolDeps,
+): SdkMcpToolDefinition<{
+  limit: z.ZodOptional<z.ZodNumber>;
+}> {
+  return tool(
+    "discord_read_history",
+    "Fetch recent messages from the current Discord thread (chronological order, " +
+      "oldest first). Useful when you need context beyond what the user just sent " +
+      "— for example, your own earlier messages, or other users' comments in the " +
+      "thread. Note: in this bot's setup, threads only contain messages from the " +
+      "same user, so this mostly gives you your own history.",
+    {
+      limit: z
+        .number()
+        .int()
+        .min(1)
+        .max(100)
+        .optional()
+        .describe("How many messages to return (default 50, max 100)"),
+    },
+    async (input, _extra) => {
+      const limit = input.limit ?? 50;
+      try {
+        const fetched = await deps.thread.messages.fetch({ limit });
+        const messages = [...fetched.values()]
+          .sort((a, b) => a.createdTimestamp - b.createdTimestamp)
+          .map((m) => ({
+            id: m.id,
+            author: m.author.username,
+            author_id: m.author.id,
+            is_bot: m.author.bot,
+            content: m.content,
+            timestamp: m.createdAt.toISOString(),
+          }));
+        return textResult(JSON.stringify({ count: messages.length, messages }));
+      } catch (err) {
+        return errorResult(`failed to read history: ${truncate(String(err), 200)}`);
+      }
+    },
+  );
+}
 
 /**
- * Mutable binding so the `tool()` factories (defined at module load time)
- * can pick up per-thread deps (thread + send wrapper) at run time.
+ * Build all four Discord tools bound to the given per-run deps.
  *
- * The `tool()` factory returns a definition object immediately, but the
- * handler closure captures `deps` via this binding. We update it before
- * every Discord run, so each tool dispatch sees the correct thread.
+ * Call this once per `runViaSdk` invocation and pass the resulting array
+ * to `createSdkMcpServer({ tools })`. Each call creates a fresh tool set
+ * whose handlers close over the specific `deps`, so concurrent runs on
+ * different threads cannot cross-contaminate (RG-012).
  *
- * This is a deliberate trade-off: defining tools with explicit `deps`
- * would require creating a new MCP server (and re-`tool()`-ing all four)
- * per thread, which is wasteful. A module-level mutable binding is fine
- * because only one Discord run executes per thread at a time (the
- * concurrency cap is enforced upstream).
+ * Tool index order (stable, relied on by tests):
+ *   0: discord_send
+ *   1: discord_typing
+ *   2: discord_react
+ *   3: discord_read_history
  */
-let deps: DiscordToolDeps;
-
-export function setDiscordToolDeps(d: DiscordToolDeps): void {
-  deps = d;
+export function createDiscordTools(
+  deps: DiscordToolDeps,
+): SdkMcpToolDefinition<any>[] {
+  return [
+    createDiscordSendTool(deps),
+    createDiscordTypingTool(deps),
+    createDiscordReactTool(deps),
+    createDiscordReadHistoryTool(deps),
+  ];
 }

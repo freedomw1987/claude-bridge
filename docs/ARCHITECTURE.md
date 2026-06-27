@@ -248,9 +248,13 @@ dispatches MCP tool calls to our registered handlers.
 
 `src/agent/sdkRunner.ts` (host-side):
 ```typescript
+// RG-012: per-run factory — each handler closure captures the per-run
+// thread + send. No shared mutable state, so concurrent SDK runs on
+// different threads cannot cross-contaminate.
+const tools = createDiscordTools({ thread, send });
 const mcpServer = createSdkMcpServer({
   name: "discord-bridge",
-  tools: allDiscordTools, // [discordSendTool, discordTypingTool, ...]
+  tools, // [discordSendTool, discordTypingTool, discordReactTool, discordReadHistoryTool]
 });
 
 const q = query({
