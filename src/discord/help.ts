@@ -7,7 +7,10 @@
  *   - reply when a user messages in a thread with no active session
  *
  * Keeping the help text + reply logic in one module so the messageCreate
- * handler (already 795 lines) doesn't keep growing.
+ * handler stays small.
+ *
+ * Phase 3 (2026-06-27): /use-cli and /use-sdk were removed (CLI runner
+ * retired). All threads use the SDK runner unconditionally.
  */
 
 import type { Message } from "discord.js";
@@ -23,17 +26,15 @@ export const HELP_TEXT = `🤖 **claude-bridge — usage**
 **Inside a thread**
 Just type messages — each one is forwarded to Claude Code.
 Context is preserved across messages (the session is resumed).
-By default, threads use the **SDK runner** (Claude Agent SDK + Discord
-tools: \`discord_send\`, \`discord_typing\`, \`discord_react\`, \`discord_read_history\`).
-Use \`/use-cli\` to switch back to the legacy streaming UX.
+All threads use the **Claude Agent SDK** with four Discord tools
+(\`discord_send\`, \`discord_typing\`, \`discord_react\`, \`discord_read_history\`)
+that Claude uses to communicate with you.
 
 **Slash commands** (inside a thread)
 • \`/repo <url|path|name>\` — change the working target
 • \`/projects\` — list all known projects
-• \`/status\` — show current session info (incl. runner kind)
+• \`/status\` — show current session info
 • \`/kill\` — stop the running session (files remain on host)
-• \`/use-cli\` — switch this thread to the CLI runner (legacy streaming)
-• \`/use-sdk\` — switch this thread to the SDK runner (tool-calling)
 • \`/help\` — show this message`;
 
 /**

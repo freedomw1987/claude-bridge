@@ -1,70 +1,38 @@
 /**
- * Active process tracking + graceful shutdown.
+ * Active SDK run tracking + graceful shutdown.
  *
- * Each message spawns a `claude -p` subprocess. If the bot gets SIGTERM
- * while claude is running, we kill the process so it doesn't get orphaned.
+ * Phase 3 (2026-06-27): the CLI subprocess runner was retired, so this
+ * file no longer needs to track raw PIDs. `activeProcessCount()` is now
+ * a thin wrapper around `activeSdkRunCount()` from sdkRunner.ts,
+ * re-exported so the streaming layer doesn't need to know which runner
+ * is in use.
  *
- * Two registries are unified here:
- *   - `activeProcesses` (below): legacy CLI PIDs tracked via trackProcess()
- *   - `activeSdkRunCount()` (sdkRunner.ts): the SDK runner's in-process
- *     query registry, since SDK runs are not separate PIDs
- *
- * `activeProcessCount()` returns the sum so the MAX_CONCURRENT_CONTAINERS
- * cap (checked in streaming.ts) applies to BOTH runners. Without this
- * unification, SDK runs would bypass the cap (10 concurrent threads
- * could spawn 10 SDK queries without any warn).
+ * `killAllProcesses()` is preserved for graceful shutdown — it forwards
+ * to `abortAllSdkRuns()` to cancel in-flight SDK queries, with a brief
+ * grace period to let them drain.
  */
 
 import { log } from "./logger";
-import { activeSdkRunCount } from "./agent/sdkRunner";
-
-const activeProcesses = new Set<number>();
-
-export function trackProcess(pid: number): void {
-  activeProcesses.add(pid);
-}
-
-export function untrackProcess(pid: number): void {
-  activeProcesses.delete(pid);
-}
+import { abortAllSdkRuns, activeSdkRunCount } from "./agent/sdkRunner";
 
 /**
- * Total in-flight claude runs (CLI + SDK).
+ * Total in-flight Claude Code runs (SDK only — Phase 3).
  * Used by MAX_CONCURRENT_CONTAINERS enforcement in streaming.ts.
  */
 export function activeProcessCount(): number {
-  return activeProcesses.size + activeSdkRunCount();
+  return activeSdkRunCount();
 }
 
 const SIGTERM_GRACE_MS = 2000;
 
 export async function killAllProcesses(): Promise<void> {
-  const pids = [...activeProcesses];
-  log.info("killing active claude processes on shutdown", {
-    cliCount: pids.length,
-    sdkCount: activeSdkRunCount(),
+  const sdkCount = activeSdkRunCount();
+  log.info("shutting down claude runs", {
+    sdkCount,
     graceMs: SIGTERM_GRACE_MS,
   });
-  // Phase 1: SIGTERM everyone
-  for (const pid of pids) {
-    try {
-      process.kill(pid, "SIGTERM");
-    } catch {
-      // Process may have already exited
-    }
-  }
-  // Phase 2: wait up to grace period for graceful exit
+  // Abort all SDK queries (closes the AbortController + query).
+  await abortAllSdkRuns();
+  // Give in-flight SDK subprocesses a brief grace period to flush.
   await new Promise<void>((r) => setTimeout(r, SIGTERM_GRACE_MS));
-  // Phase 3: SIGKILL any survivors that didn't honor SIGTERM
-  for (const pid of pids) {
-    if (activeProcesses.has(pid)) {
-      try {
-        process.kill(pid, "SIGKILL");
-        log.warn("force-killed claude process (did not exit on SIGTERM)", { pid });
-      } catch {
-        // Already dead
-      }
-    }
-  }
-  activeProcesses.clear();
 }

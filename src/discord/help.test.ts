@@ -17,13 +17,11 @@ test("HELP_TEXT documents all slash commands", () => {
   expect(HELP_TEXT).toContain("/projects");
   expect(HELP_TEXT).toContain("/status");
   expect(HELP_TEXT).toContain("/kill");
-  expect(HELP_TEXT).toContain("/use-cli");
-  expect(HELP_TEXT).toContain("/use-sdk");
   expect(HELP_TEXT).toContain("/help");
 });
 
 test("HELP_TEXT explains the SDK runner default", () => {
-  expect(HELP_TEXT).toMatch(/SDK runner/i);
+  expect(HELP_TEXT).toMatch(/Claude Agent SDK/i);
   expect(HELP_TEXT).toMatch(/discord_send/i);
 });
 

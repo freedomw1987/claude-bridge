@@ -60,11 +60,8 @@ export const config = {
     systemPromptFile: expandTilde(
       optional("CLAUDE_SYSTEM_PROMPT_FILE", "dev_agent/adapters/claude-code/agent.md"),
     ),
-    // Phase 1: SDK opt-in. When enabled, the bot uses the Claude Agent SDK
-    // (@anthropic-ai/claude-agent-sdk) instead of shelling out to `claude -p`.
-    // Tool calls (discord_send, discord_typing, discord_react, discord_read_history)
-    // are executed by the SDK's MCP transport; the bot stays a thin proxy.
-    useSdk: optional("CLAUDE_USE_SDK", "0") === "1",
+    // Optional model override for the Claude Agent SDK (e.g. "claude-sonnet-4-6").
+    // Empty = SDK default.
     sdkModel: optional("CLAUDE_SDK_MODEL", ""),
     // Default to "bypassPermissions" so the headless SDK doesn't try to
     // render an interactive permission prompt UI for Bash writes
@@ -74,7 +71,6 @@ export const config = {
     // Hard cap on a single Claude run. The SDK's native abortController
     // is wired to this timeout; on expiry the run is killed and the user
     // gets a "turn timeout exceeded" error (not a generic crash).
-    // ADR-0002 future work #2.
     turnTimeoutMs: optionalInt("CLAUDE_TURN_TIMEOUT_MS", 60 * 60 * 1000),
   },
   hermes: {

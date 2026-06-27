@@ -1,11 +1,15 @@
 /**
- * Tests for slash command matchers + /use-cli / /use-sdk handlers.
+ * Tests for slash command matchers + handlers.
+ *
+ * Phase 3 (2026-06-27): /use-cli and /use-sdk handlers were removed
+ * (CLI runner retired). This file now focuses on the remaining
+ * commands: /kill, /status, /projects, /repo, /help.
  *
  * Focus areas:
- *   - isUseCliCommand / isUseSdkCommand match the right inputs (and reject lookalikes)
- *   - dispatchCommand routes the new commands to the right handlers
- *   - handleUseCli / handleUseSdk update runnerKind via store.setRunnerKind
- *   - Both handlers short-circuit when the runner is already the requested one
+ *   - matchers identify the right inputs and reject lookalikes
+ *   - dispatchCommand routes to the right handler
+ *   - /kill calls store.setStatus('killed')
+ *   - /help works without a session
  */
 
 import {
@@ -18,8 +22,11 @@ import {
 } from "bun:test";
 import type { Message } from "discord.js";
 import {
-  isUseCliCommand,
-  isUseSdkCommand,
+  isKillCommand,
+  isStatusCommand,
+  isProjectsCommand,
+  isHelpCommand,
+  matchRepoCommand,
   dispatchCommand,
 } from "./commands";
 import type { Session } from "../../types";
@@ -47,14 +54,12 @@ function fakeSession(overrides: Partial<Session> = {}): Session {
     mode: "manual",
     milestoneGoal: null,
     milestoneCriteria: null,
-    runnerKind: "sdk",
     ...overrides,
   };
 }
 
 function fakeStore(): SessionStore {
   return {
-    setRunnerKind: mock((_id: string, _kind: "cli" | "sdk") => undefined),
     setStatus: mock((_id: string, _s: string) => undefined),
     get: mock((_id: string) => null),
   } as unknown as SessionStore;
@@ -62,94 +67,108 @@ function fakeStore(): SessionStore {
 
 // ---- Matcher tests ----
 
-describe("isUseCliCommand", () => {
-  it("matches /use-cli", () => {
-    expect(isUseCliCommand("/use-cli")).toBe(true);
+describe("isKillCommand", () => {
+  it("matches /kill", () => {
+    expect(isKillCommand("/kill")).toBe(true);
   });
   it("matches case-insensitively and trims whitespace", () => {
-    expect(isUseCliCommand("/USE-CLI")).toBe(true);
-    expect(isUseCliCommand("  /use-cli  ")).toBe(true);
-  });
-  it("matches /use-cli with trailing text", () => {
-    expect(isUseCliCommand("/use-cli please")).toBe(true);
+    expect(isKillCommand("/KILL")).toBe(true);
+    expect(isKillCommand("  /kill  ")).toBe(true);
   });
   it("does not match lookalikes", () => {
-    expect(isUseCliCommand("/use-sdk")).toBe(false);
-    expect(isUseCliCommand("/useclic")).toBe(false);
-    expect(isUseCliCommand("use-cli")).toBe(false); // no slash
-    expect(isUseCliCommand("/use")).toBe(false);
+    expect(isKillCommand("/killed")).toBe(false);
+    expect(isKillCommand("kill")).toBe(false); // no slash
+    expect(isKillCommand("/help")).toBe(false);
   });
 });
 
-describe("isUseSdkCommand", () => {
-  it("matches /use-sdk", () => {
-    expect(isUseSdkCommand("/use-sdk")).toBe(true);
-  });
-  it("matches case-insensitively and trims whitespace", () => {
-    expect(isUseSdkCommand("/USE-SDK")).toBe(true);
-    expect(isUseSdkCommand("  /use-sdk  ")).toBe(true);
+describe("isStatusCommand", () => {
+  it("matches /status", () => {
+    expect(isStatusCommand("/status")).toBe(true);
   });
   it("does not match lookalikes", () => {
-    expect(isUseSdkCommand("/use-cli")).toBe(false);
-    expect(isUseSdkCommand("/usesdk")).toBe(false);
-    expect(isUseSdkCommand("/use")).toBe(false);
+    expect(isStatusCommand("/stats")).toBe(false);
+    expect(isStatusCommand("status")).toBe(false);
+  });
+});
+
+describe("isProjectsCommand", () => {
+  it("matches /projects", () => {
+    expect(isProjectsCommand("/projects")).toBe(true);
+  });
+  it("does not match lookalikes", () => {
+    expect(isProjectsCommand("/project")).toBe(false);
+    expect(isProjectsCommand("/project-list")).toBe(false);
+  });
+});
+
+describe("isHelpCommand", () => {
+  it("matches /help", () => {
+    expect(isHelpCommand("/help")).toBe(true);
+  });
+});
+
+describe("matchRepoCommand", () => {
+  it("extracts the target after /repo", () => {
+    expect(matchRepoCommand("/repo https://github.com/foo/bar")).toBe(
+      "https://github.com/foo/bar",
+    );
+    expect(matchRepoCommand("/repo myproject")).toBe("myproject");
+  });
+  it("returns null when no target", () => {
+    expect(matchRepoCommand("/repo")).toBeNull();
+    expect(matchRepoCommand("/help")).toBeNull();
   });
 });
 
 // ---- Dispatch tests ----
 
-describe("dispatchCommand — runner kind switching", () => {
+describe("dispatchCommand", () => {
   let store: SessionStore;
   let ctx: { msg: Message; store: SessionStore; projects: any };
 
   beforeEach(() => {
     store = fakeStore();
     ctx = {
-      msg: fakeMsg("/use-cli"),
+      msg: fakeMsg("/status"),
       store,
       projects: {} as any,
     };
   });
 
-  it("dispatches /use-cli to handleUseCli, which calls store.setRunnerKind('cli')", async () => {
-    const session = fakeSession({ runnerKind: "sdk" });
-    const handled = await dispatchCommand("/use-cli", session, ctx);
+  it("dispatches /status to handleStatus", async () => {
+    const session = fakeSession();
+    ctx.msg = fakeMsg("/status");
+    // /status calls store.get internally; mock it to return our session
+    (store.get as any) = mock((_id: string) => session);
+    const handled = await dispatchCommand("/status", session, ctx);
     expect(handled).toBe(true);
-    expect((store.setRunnerKind as Mock<any>).mock.calls[0]).toEqual([
+  });
+
+  it("dispatches /kill to handleKill, which calls store.setStatus", async () => {
+    const session = fakeSession();
+    ctx.msg = fakeMsg("/kill");
+    const handled = await dispatchCommand("/kill", session, ctx);
+    expect(handled).toBe(true);
+    expect((store.setStatus as Mock<any>).mock.calls[0]).toEqual([
       "thread-1",
-      "cli",
+      "killed",
     ]);
   });
 
-  it("dispatches /use-sdk to handleUseSdk, which calls store.setRunnerKind('sdk')", async () => {
-    const session = fakeSession({ runnerKind: "cli" });
-    ctx.msg = fakeMsg("/use-sdk");
-    const handled = await dispatchCommand("/use-sdk", session, ctx);
+  it("dispatches /help even when session is null", async () => {
+    const handled = await dispatchCommand("/help", null, ctx);
     expect(handled).toBe(true);
-    expect((store.setRunnerKind as Mock<any>).mock.calls[0]).toEqual([
-      "thread-1",
-      "sdk",
-    ]);
   });
 
-  it("short-circuits /use-cli when already on CLI", async () => {
-    const session = fakeSession({ runnerKind: "cli" });
-    const handled = await dispatchCommand("/use-cli", session, ctx);
-    expect(handled).toBe(true);
-    // store.setRunnerKind should NOT be called — already on CLI.
-    expect((store.setRunnerKind as Mock<any>).mock.calls.length).toBe(0);
+  it("returns false (forwards to Claude) when content is not a command", async () => {
+    const session = fakeSession();
+    const handled = await dispatchCommand("just a regular message", session, ctx);
+    expect(handled).toBe(false);
   });
 
-  it("short-circuits /use-sdk when already on SDK", async () => {
-    const session = fakeSession({ runnerKind: "sdk" });
-    ctx.msg = fakeMsg("/use-sdk");
-    const handled = await dispatchCommand("/use-sdk", session, ctx);
-    expect(handled).toBe(true);
-    expect((store.setRunnerKind as Mock<any>).mock.calls.length).toBe(0);
-  });
-
-  it("returns false (forwards to Claude) when session is null", async () => {
-    const handled = await dispatchCommand("/use-cli", null, ctx);
+  it("returns false for sessionless messages that aren't /help", async () => {
+    const handled = await dispatchCommand("/kill", null, ctx);
     expect(handled).toBe(false);
   });
 });
