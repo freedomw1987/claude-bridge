@@ -79,6 +79,13 @@ export interface SdkRunResult {
 interface ActiveRun {
   query: Query;
   aborted: boolean;
+  // G3 (2026-06-27): the thread is stored alongside the query so the
+  // graceful-shutdown path (cleanup.ts) can post a "restarting" warning
+  // to each thread with in-flight work without re-importing Discord
+  // machinery into sdkRunner. We don't import discord.js in this file's
+  // top-level imports either — the type comes through `runViaSdk`'s
+  // argument via structural compatibility.
+  thread: import("discord.js").ThreadChannel;
 }
 
 const activeRuns = new Map<string, ActiveRun>();
@@ -89,6 +96,15 @@ export function activeSdkRunCount(): number {
 
 export function isSdkRunActive(threadId: string): boolean {
   return activeRuns.has(threadId);
+}
+
+/**
+ * G3: snapshot of currently-active SDK runs for the shutdown path.
+ * Returns a stable array of thread IDs — caller can iterate safely
+ * even if a run completes (and removes itself from the map) mid-shutdown.
+ */
+export function getActiveSdkRunIds(): string[] {
+  return [...activeRuns.keys()];
 }
 
 /**
@@ -237,7 +253,7 @@ export async function runViaSdk(
     };
   }
 
-  const run: ActiveRun = { query: q, aborted: false };
+  const run: ActiveRun = { query: q, aborted: false, thread };
   activeRuns.set(session.threadId, run);
 
   // Turn timeout — if the SDK's AbortController fires (via the timer

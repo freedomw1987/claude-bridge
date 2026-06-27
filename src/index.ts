@@ -183,7 +183,28 @@ async function main(): Promise<void> {
     log.info("shutting down", { signal });
     if (idleSweep) clearInterval(idleSweep);
     stopMemoryMonitor();
-    await killAllProcesses();
+    // G3 (2026-06-27): post a "bot restarting" warning to each thread
+    // with in-flight SDK work BEFORE the abort. The notifier uses
+    // client.channels.fetch() which is async-safe — we catch per-thread
+    // errors inside killAllProcesses so a Discord hiccup doesn't block
+    // shutdown. The grace period (SHUTDOWN_GRACE_MS, default 30s)
+    // lets short Claude turns finish naturally.
+    await killAllProcesses({
+      notifier: async (threadId, message) => {
+        try {
+          const ch = await client.channels.fetch(threadId);
+          if (ch && ch.isThread()) {
+            await (ch as ThreadChannel).send(message);
+          }
+        } catch (err) {
+          // Swallow — Discord unreachable shouldn't block shutdown.
+          log.warn("shutdown: failed to notify thread", {
+            threadId,
+            err: String(err),
+          });
+        }
+      },
+    });
     client.destroy();
     store.close();
     log.info("goodbye");

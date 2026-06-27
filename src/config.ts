@@ -54,6 +54,13 @@ export const config = {
     // (`ts,rssMB,heapUsedMB`). Use to validate SDK-era long-task behavior.
     ramTraceEnabled: optional("BOT_RAM_TRACE", "0") === "1",
     ramTracePath: expandTilde(optional("BOT_RAM_TRACE_PATH", "")),
+    // Graceful shutdown grace period (G1, 2026-06-27). When SIGTERM/SIGINT
+    // arrives, in-flight SDK runs are given this long to finish naturally
+    // before being forcibly aborted. Override via SHUTDOWN_GRACE_MS env
+    // (in milliseconds). 30s default — long enough for a short Claude
+    // turn to finish, short enough that an impatient operator can
+    // SIGKILL after ~30s without losing much work.
+    shutdownGraceMs: optionalInt("SHUTDOWN_GRACE_MS", 30_000),
   },
   claude: {
     defaultPermissionMode: optional("CLAUDE_DEFAULT_PERMISSION_MODE", "acceptEdits"),
