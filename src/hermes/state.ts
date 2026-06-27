@@ -164,10 +164,17 @@ export function loadState(
 }
 
 /**
- * Append a journal entry both to the in-memory state.journal array and to
- * the durable journal.log file. The in-memory copy is small (last N entries
- * is fine; we keep all of them for now) and exists for /project status
- * quick view; the file is the source of truth for after-restart replay.
+ * Append a journal entry to the durable journal.log file. The file is
+ * the source of truth — there is no in-memory mirror in state.journal
+ * (callers that need an in-memory journal array should keep their own
+ * local list and append to it after this call returns).
+ *
+ * Why no in-memory mirror: the previous implementation did a sync
+ * `loadState` + `state.journal.push(full)` after every append, but no
+ * caller followed up with `saveState()`, so the mutation was silently
+ * discarded on the next `loadState`. The disk read + JSON.parse were
+ * pure waste (Hermes auto-mode did ~20 of these per project). Removed
+ * 2026-06-27.
  */
 export function appendJournal(
   hermesDir: string,
@@ -184,12 +191,6 @@ export function appendJournal(
     join(dir, "journal.log"),
     `${full.ts} [${full.type}] ${full.message}\n`,
   );
-  // Best-effort mirror to state.json. Caller should saveState() afterward
-  // to make the in-memory copy atomic — this is just an in-place mutation.
-  const state = loadState(hermesDir, projectId);
-  if (state) {
-    state.journal.push(full);
-  }
 }
 
 /** Write the human-readable plan.md (called once after planning completes). */

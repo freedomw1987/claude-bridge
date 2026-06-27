@@ -111,6 +111,11 @@ export class ProjectRegistry {
         const entries = readdirSync(this.root, { withFileTypes: true });
         let scanned = 0;
         for (const entry of entries) {
+          // Q1 (2026-06-27): skip the redundant statSync for regular
+          // directories. `withFileTypes: true` already tells us this is
+          // a directory; statSync would only add value for symlinks
+          // (where we need to follow). For 60 projects that means
+          // ~59 fewer syscalls per scan.
           if (!entry.isDirectory() && !entry.isSymbolicLink()) continue;
           if (entry.name.startsWith(".")) continue;
           if (this.hidden.has(entry.name)) continue;
@@ -118,12 +123,14 @@ export class ProjectRegistry {
           // Don't override config-provided entries
           if (this.byName.has(entry.name.toLowerCase())) continue;
           const fullPath = join(this.root, entry.name);
-          // Make sure it resolves to a real directory
-          try {
-            const st = statSync(fullPath);
-            if (!st.isDirectory()) continue;
-          } catch {
-            continue;
+          if (entry.isSymbolicLink()) {
+            // Only follow symlinks — and only if they resolve to a directory.
+            try {
+              const st = statSync(fullPath);
+              if (!st.isDirectory()) continue;
+            } catch {
+              continue;
+            }
           }
           this.byName.set(entry.name.toLowerCase(), {
             name: entry.name,

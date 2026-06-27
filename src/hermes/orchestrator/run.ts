@@ -86,119 +86,131 @@ export async function runProject(
   typing.start();
 
   try {
-    // ── 1. Planning ───────────────────────────────────────────────
-    if (state.status === "planning") {
-      state = await doPlanning(state, deps);
-    }
+    // The outer loop covers the full lifecycle. Each iteration is one
+    // pass through planning → executing → judging. The judge may add
+    // more tasks (verdict="needs_more"); we restart the outer loop to
+    // pick them up. Using a loop instead of recursion (B2, 2026-06-27)
+    // keeps the call stack bounded — a 5-10 task project no longer grows
+    // a stack 5-10 deep.
+    const LOOP_GUARD_LIMIT = 100;
+    let outerLoopGuard = 0;
+    outer: while (true) {
+      if (++outerLoopGuard > LOOP_GUARD_LIMIT) {
+        log.error("hermes orchestrator: outer loop guard tripped", { projectId });
+        state.status = "failed";
+        state.endedAt = new Date().toISOString();
+        saveState(deps.hermesDir, projectId, state);
+        await send(formatEscalation(state, "internal: orchestrator outer loop guard tripped"));
+        return;
+      }
 
-    // ── 2. Executing (with judge loop) ─────────────────────────────
-    let loopGuard = 0;
-    while (state.status === "executing") {
-      // Reload state from disk at the top of every iteration to detect
-      // external changes (e.g., /project kill, /project resume). Without
-      // this, the orchestrator would keep running on its local copy of
-      // state and never see the kill flag the user just wrote to disk.
-      const fresh = loadState(deps.hermesDir, projectId);
-      if (fresh && fresh.status !== state.status) {
-        log.info("hermes orchestrator: external state change detected", {
-          projectId,
-          from: state.status,
-          to: fresh.status,
-        });
-        state = fresh;
-        if (state.status !== "executing") {
-          // External transition (e.g., killed, failed) — exit cleanly.
-          await send(
-            `${HERMES_PREFIX} ⏹️ Project \`${state.id.slice(0, 8)}\` ${state.status} (external).`,
-          );
+      // ── 1. Planning ─────────────────────────────────────────────
+      if (state.status === "planning") {
+        state = await doPlanning(state, deps);
+      }
+
+      // ── 2. Executing (inner loop, one task per iteration) ───────
+      while (state.status === "executing") {
+        // Reload state from disk at the top of every iteration to detect
+        // external changes (e.g., /project kill, /project resume). Without
+        // this, the orchestrator would keep running on its local copy of
+        // state and never see the kill flag the user just wrote to disk.
+        const fresh = loadState(deps.hermesDir, projectId);
+        if (fresh && fresh.status !== state.status) {
+          log.info("hermes orchestrator: external state change detected", {
+            projectId,
+            from: state.status,
+            to: fresh.status,
+          });
+          state = fresh;
+          if (state.status !== "executing") {
+            // External transition (e.g., killed, failed) — exit cleanly.
+            await send(
+              `${HERMES_PREFIX} ⏹️ Project \`${state.id.slice(0, 8)}\` ${state.status} (external).`,
+            );
+            return;
+          }
+        }
+
+        if (shouldStop(state)) {
+          state.status = "failed";
+          state.endedAt = new Date().toISOString();
+          saveState(deps.hermesDir, projectId, state);
+          appendJournal(deps.hermesDir, projectId, {
+            type: "escalate",
+            message: "safety cap reached; stopping",
+          });
+          await send(formatEscalation(state, "safety cap reached (cost / time / iterations)"));
           return;
         }
+
+        const task = pickNextTask(state);
+        if (!task) {
+          // No more pending tasks with satisfied deps → judge time.
+          state.status = "judging";
+          saveState(deps.hermesDir, projectId, state);
+          break;
+        }
+
+        state = await runOneTask(state, task, deps);
       }
 
-      if (++loopGuard > 100) {
-        log.error("hermes orchestrator: loop guard tripped", { projectId });
-        state.status = "failed";
-        state.endedAt = new Date().toISOString();
-        saveState(deps.hermesDir, projectId, state);
-        await send(formatEscalation(state, "internal: orchestrator loop guard tripped"));
-        return;
-      }
+      // ── 3. Judging ─────────────────────────────────────────────
+      if (state.status === "judging") {
+        // ADR-0004 M2.4: timer boundary check before invoking judge LLM.
+        // Soft-exit at the judge boundary (not at task boundary) so the
+        // in-flight task's result is preserved on disk and David can
+        // /project resume without losing work.
+        const timerExpired = checkTimerExpired(state);
+        if (timerExpired) {
+          log.info("hermes orchestrator: timer expired at judge boundary", {
+            projectId,
+            expiresAt: state.timer?.expiresAt,
+            requested: state.timer?.requestedDuration,
+          });
+          state = await softExit(projectId, state, deps, "duration_expired");
+          return;
+        }
 
-      if (shouldStop(state)) {
-        state.status = "failed";
-        state.endedAt = new Date().toISOString();
-        saveState(deps.hermesDir, projectId, state);
-        appendJournal(deps.hermesDir, projectId, {
-          type: "escalate",
-          message: "safety cap reached; stopping",
-        });
-        await send(formatEscalation(state, "safety cap reached (cost / time / iterations)"));
-        return;
-      }
-
-      const task = pickNextTask(state);
-      if (!task) {
-        // No more pending tasks with satisfied deps → judge time.
-        state.status = "judging";
-        saveState(deps.hermesDir, projectId, state);
-        break;
-      }
-
-      state = await runOneTask(state, task, deps);
-    }
-
-    // ── 3. Judging ─────────────────────────────────────────────────
-    if (state.status === "judging") {
-      // ADR-0004 M2.4: timer boundary check before invoking judge LLM.
-      // Soft-exit at the judge boundary (not at task boundary) so the
-      // in-flight task's result is preserved on disk and David can
-      // /project resume without losing work.
-      const timerExpired = checkTimerExpired(state);
-      if (timerExpired) {
-        log.info("hermes orchestrator: timer expired at judge boundary", {
-          projectId,
-          expiresAt: state.timer?.expiresAt,
-          requested: state.timer?.requestedDuration,
-        });
-        state = await softExit(projectId, state, deps, "duration_expired");
-        return;
-      }
-
-      const verdict = await judgeProject(state);
-      state.lastVerdict = verdict;
-      appendJournal(deps.hermesDir, projectId, {
-        type: "judge",
-        message: `verdict=${verdict.verdict}: ${verdict.reasoning.slice(0, 300)}`,
-      });
-
-      if (verdict.verdict === "done") {
-        state.status = "done";
-        state.endedAt = new Date().toISOString();
-        saveState(deps.hermesDir, projectId, state);
-        await send(formatCompletion(state));
-        return;
-      }
-      if (verdict.verdict === "needs_more" && verdict.nextTasks && verdict.nextTasks.length > 0) {
-        // Append new tasks; continue executing.
-        const nextIds = verdict.nextTasks.map((t) => t.id);
-        state.plan.push(...verdict.nextTasks);
-        state.status = "executing";
-        saveState(deps.hermesDir, projectId, state);
+        const verdict = await judgeProject(state);
+        state.lastVerdict = verdict;
         appendJournal(deps.hermesDir, projectId, {
           type: "judge",
-          message: `added ${verdict.nextTasks.length} task(s): ${nextIds.join(", ")}`,
+          message: `verdict=${verdict.verdict}: ${verdict.reasoning.slice(0, 300)}`,
         });
-        await send(
-          `${HERMES_PREFIX} 🔄 Judge added ${verdict.nextTasks.length} more task(s): ${nextIds.join(", ")}. Continuing...`,
-        );
-        // Recurse to continue the executing loop.
-        return runProject(projectId, deps);
+
+        if (verdict.verdict === "done") {
+          state.status = "done";
+          state.endedAt = new Date().toISOString();
+          saveState(deps.hermesDir, projectId, state);
+          await send(formatCompletion(state));
+          return;
+        }
+        if (verdict.verdict === "needs_more" && verdict.nextTasks && verdict.nextTasks.length > 0) {
+          // Append new tasks; restart the outer loop to pick them up.
+          const nextIds = verdict.nextTasks.map((t) => t.id);
+          state.plan.push(...verdict.nextTasks);
+          state.status = "executing";
+          saveState(deps.hermesDir, projectId, state);
+          appendJournal(deps.hermesDir, projectId, {
+            type: "judge",
+            message: `added ${verdict.nextTasks.length} task(s): ${nextIds.join(", ")}`,
+          });
+          await send(
+            `${HERMES_PREFIX} 🔄 Judge added ${verdict.nextTasks.length} more task(s): ${nextIds.join(", ")}. Continuing...`,
+          );
+          continue outer;  // B2: was a recursive runProject() call
+        }
+        // "stuck" or "needs_more" without nextTasks
+        state.status = "failed";
+        state.endedAt = new Date().toISOString();
+        saveState(deps.hermesDir, projectId, state);
+        await send(formatEscalation(state, `judge says ${verdict.verdict}: ${verdict.reasoning}`));
+        return;
       }
-      // "stuck" or "needs_more" without nextTasks
-      state.status = "failed";
-      state.endedAt = new Date().toISOString();
-      saveState(deps.hermesDir, projectId, state);
-      await send(formatEscalation(state, `judge says ${verdict.verdict}: ${verdict.reasoning}`));
+
+      // state.status is not planning / executing / judging — terminal
+      // (e.g., resumed into a done/failed/killed project). Nothing to do.
       return;
     }
   } catch (err) {

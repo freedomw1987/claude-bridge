@@ -215,6 +215,30 @@ describe("appendJournal", () => {
     );
     expect(content.startsWith("2026-06-22T00:00:00.000Z [status]")).toBe(true);
   });
+
+  test("does NOT mutate state.json on disk (in-memory mirror removed 2026-06-27)", () => {
+    // B1 regression guard: the previous implementation did a sync
+    // loadState + state.journal.push(full) after every append, but no
+    // caller followed with saveState(), so the mutation was silently
+    // discarded. After the fix, appendJournal is a single appendFileSync
+    // and the state.json on disk is not touched.
+    ensureProjectDir(hermesDir, projectId);
+    saveState(hermesDir, projectId, baseState());
+    const statePath = projectDir(hermesDir, projectId) + "/state.json";
+    const stateBefore = readFileSync(statePath, "utf8");
+    appendJournal(hermesDir, projectId, {
+      type: "task_start",
+      message: "t1: do thing",
+    });
+    const stateAfter = readFileSync(statePath, "utf8");
+    expect(stateAfter).toBe(stateBefore);
+    // And the journal.log on disk does have the entry.
+    const journalContent = readFileSync(
+      projectDir(hermesDir, projectId) + "/journal.log",
+      "utf8",
+    );
+    expect(journalContent).toContain("[task_start] t1: do thing");
+  });
 });
 
 describe("listProjects", () => {
