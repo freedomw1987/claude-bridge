@@ -9,10 +9,13 @@
  * Invariant: After stripThinkTags, the result MUST NOT contain any
  * opening or closing tag matching `(?i)<think|ant_thinking` in any
  * form. If a refactor breaks this, the leak resurfaces in Discord.
+ *
+ * Phase 3 (2026-06-27): removed formatToolResult tests — the function
+ * was CLI-streaming-only and had no callers after the CLI runner retired.
  */
 
 import { describe, test, expect } from "bun:test";
-import { stripThinkTags, formatToolResult } from "./format";
+import { stripThinkTags } from "./format";
 
 const TAG_RE = /<\s*\/?\s*(?:ant_)?think(?:ing)?\s*>/i;
 
@@ -147,88 +150,5 @@ describe("stripThinkTags (RG-002)", () => {
     const out = stripThinkTags(input);
     expect(out).not.toMatch(TAG_RE);
     expect(out).toBe("Answer.");
-  });
-});
-
-describe("formatToolResult", () => {
-  test("returns empty string for empty input", () => {
-    expect(formatToolResult("", false)).toBe("");
-    expect(formatToolResult("", true)).toBe("");
-  });
-
-  test("returns empty string for whitespace-only input", () => {
-    expect(formatToolResult("   \n\n\t  \n", false)).toBe("");
-  });
-
-  test("returns plain text unchanged when short", () => {
-    expect(formatToolResult("file written", false)).toBe("file written");
-  });
-
-  test("prefixes with ❌ on isError", () => {
-    expect(formatToolResult("permission denied", true)).toBe("❌ permission denied");
-  });
-
-  test("truncates long input with ellipsis (default 200)", () => {
-    const long = "a".repeat(500);
-    const out = formatToolResult(long, false);
-    expect(out.length).toBe(200);
-    expect(out.endsWith("…")).toBe(true);
-  });
-
-  test("respects custom max", () => {
-    const out = formatToolResult("x".repeat(100), false, 50);
-    expect(out.length).toBe(50);
-    expect(out.endsWith("…")).toBe(true);
-  });
-
-  test("does not add ellipsis when input fits exactly", () => {
-    const exact = "a".repeat(200);
-    expect(formatToolResult(exact, false)).toBe(exact);
-    expect(formatToolResult(exact, false).endsWith("…")).toBe(false);
-  });
-
-  test("collapses newlines and tabs into single spaces", () => {
-    // Multi-line tool output (e.g. file dump, error stack) compresses
-    // to one readable line — critical for the 1500-char status banner
-    // which would otherwise overflow when many tools fire in succession.
-    const multi = "line 1\nline 2\n\tline 3\n\nline 4";
-    expect(formatToolResult(multi, false)).toBe("line 1 line 2 line 3 line 4");
-  });
-
-  test("collapses internal runs of spaces", () => {
-    expect(formatToolResult("a   b    c", false)).toBe("a b c");
-  });
-
-  test("truncates AFTER collapsing (multi-line long output)", () => {
-    // 50 short lines joined → ~250 chars → still under 200 → truncated
-    const manyLines = Array.from({ length: 50 }, (_, i) => `line ${i + 1}`).join("\n");
-    const out = formatToolResult(manyLines, false);
-    // After collapse: "line 1 line 2 line 3 ... line 50" ≈ 200+ chars
-    expect(out.length).toBeLessThanOrEqual(200);
-    expect(out.endsWith("…")).toBe(true);
-    expect(out).toContain("line 1");
-    expect(out).toContain("line 2");
-  });
-
-  test("error preview also collapses and truncates", () => {
-    const longErr = "TypeError: foo\n  at bar (x.js:1:1)\n  at baz (y.js:2:2)\n";
-    const out = formatToolResult(longErr, true);
-    expect(out.startsWith("❌ ")).toBe(true);
-    expect(out.length).toBeLessThanOrEqual(201); // 200 + leading "❌ "
-    expect(out).not.toContain("\n");
-  });
-
-  test("does NOT prepend ❌ when isError is false even if input has 'error' word", () => {
-    // Edge case: a successful Bash result that contains the substring
-    // "error" should not be flagged.
-    expect(formatToolResult("0 errors, 3 warnings", false)).toBe(
-      "0 errors, 3 warnings",
-    );
-  });
-
-  test("trims leading and trailing whitespace after collapse", () => {
-    expect(formatToolResult("\n\n  hello world  \n", false)).toBe(
-      "hello world",
-    );
   });
 });
