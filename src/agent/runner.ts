@@ -20,6 +20,42 @@ import type {
 // to each decode() invocation).
 const TEXT_DECODER = new TextDecoder();
 
+/**
+ * Whitelist of env vars passed to the `claude` subprocess.
+ * Forwarding the entire process.env leaks secrets (AWS_*, GITHUB_TOKEN,
+ * NPM_TOKEN, etc.) — we only pass what the Claude CLI / Agent SDK
+ * actually needs to authenticate and run.
+ *
+ * The list is intentionally explicit (not a denylist) so that adding a
+ * new env var to the host does NOT silently leak it into the
+ * subprocess. To allow a new var, add it here.
+ */
+const SAFE_ENV_KEYS = [
+  // System / locale
+  "PATH", "HOME", "USER", "SHELL", "LANG", "LC_ALL", "TZ", "TMPDIR",
+  "DISPLAY", // X11 tools in some setups
+  "TERM", "COLORTERM", // terminal capability detection
+  // Claude auth + SDK config
+  "ANTHROPIC_API_KEY",
+  "ANTHROPIC_AUTH_TOKEN",
+  "ANTHROPIC_BASE_URL",
+  "ANTHROPIC_MODEL",
+  "CLAUDE_CODE_USE_BEDROCK",
+  "CLAUDE_CODE_USE_VERTEX",
+  "CLAUDE_CODE_OAUTH_TOKEN", // rare; explicit opt-in
+  // Node / Bun introspection that some SDK code paths read
+  "NODE_ENV", "BUN_ENV",
+] as const;
+
+function buildSafeEnv(): Record<string, string> {
+  const env: Record<string, string> = {};
+  for (const key of SAFE_ENV_KEYS) {
+    const v = process.env[key];
+    if (v != null) env[key] = v;
+  }
+  return env;
+}
+
 export interface ClaudeRunnerOptions {
   prompt: string;
   cwd: string; // working dir for claude (will be the per-thread repo path)
@@ -178,7 +214,12 @@ export async function runClaude(
     cwd: opts.cwd,
     stdout: "pipe",
     stderr: "pipe",
-    env: { ...process.env },
+    // Q3 (2026-06-27): whitelist env vars instead of forwarding
+    // `...process.env`. Forwarding the entire env leaks secrets
+    // (AWS_*, GITHUB_*, NPM_TOKEN, etc.) into the claude subprocess
+    // and any tool it spawns. Only the keys claude CLI / SDK actually
+    // need are passed through; everything else is dropped.
+    env: buildSafeEnv(),
   });
 
   trackProcess(proc.pid);

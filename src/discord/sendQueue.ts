@@ -27,10 +27,13 @@ export class SendQueue {
 
   /**
    * @param minIntervalMs minimum gap between consecutive sends.
-   *   Default 1100ms (just under 5 sends / 5s = 1 every 1s; 10% safety margin).
-   *   The first send is always immediate regardless of this value.
+   *   Default 1000ms (Discord's per-channel limit is 5 msg / 5s = 1 msg/s;
+   *   1000ms is exactly at the limit, +0% margin — works because the
+   *   SendQueue is per-run and short-lived, so the 5-msg burst over
+   *   5-second window rarely gets hit. The first send is always
+   *   immediate regardless of this value.
    */
-  constructor(minIntervalMs: number = 1100) {
+  constructor(minIntervalMs: number = 1000) {
     this.minIntervalMs = minIntervalMs;
   }
 
