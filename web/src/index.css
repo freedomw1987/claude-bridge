@@ -1,0 +1,79 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Hermes Tracker APP — theme variables.
+ *
+ * Light mode is the default (no class on <html>). The `.dark` class
+ * on <html> switches to dark mode. The `useTheme` hook manages the
+ * class and persists the choice in localStorage; if no choice is
+ * persisted, we fall back to `prefers-color-scheme` media query
+ * (handled by the inline script in index.html).
+ *
+ * Color tokens are referenced by Tailwind's theme.extend.colors map
+ * (see tailwind.config.ts) so components can write `bg-bg-soft`,
+ * `text-fg`, `border-border`, etc. without caring which theme is
+ * active.
+ */
+:root {
+  --color-bg: #ffffff;
+  --color-bg-soft: #f7f8fa;
+  --color-bg-elev: #eef0f3;
+  --color-border: #e3e5e8;
+  --color-border-strong: #c9ccd1;
+  --color-fg: #060607;
+  --color-fg-dim: #4f5660;
+  --color-fg-muted: #808389;
+  --color-accent: #5865f2;
+  --color-accent-hover: #4752c4;
+  --color-success: #3ba55d;
+  --color-warn: #faa81a;
+  --color-danger: #ed4245;
+}
+
+.dark {
+  --color-bg: #1e1f22;
+  --color-bg-soft: #2b2d31;
+  --color-bg-elev: #34363c;
+  --color-border: #3f4147;
+  --color-border-strong: #4e5057;
+  --color-fg: #f2f3f5;
+  --color-fg-dim: #b5bac1;
+  --color-fg-muted: #808389;
+  --color-accent: #5865f2;
+  --color-accent-hover: #7983f5;
+  --color-success: #57f287;
+  --color-warn: #fee75c;
+  --color-danger: #ed4245;
+}
+
+/* Base body styling — Tailwind utilities inherit the variables above. */
+html, body {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--color-bg);
+  color: var(--color-fg);
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text",
+    "Segoe UI", Roboto, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Custom scrollbar in dark mode (matches Discord feel) */
+.dark ::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+.dark ::-webkit-scrollbar-track {
+  background: var(--color-bg);
+}
+.dark ::-webkit-scrollbar-thumb {
+  background: var(--color-border-strong);
+  border-radius: 5px;
+}
+.dark ::-webkit-scrollbar-thumb:hover {
+  background: var(--color-fg-muted);
+}

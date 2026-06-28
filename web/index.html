@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <meta name="theme-color" content="#1e1f22" media="(prefers-color-scheme: dark)" />
+    <meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)" />
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <title>Hermes Tracker</title>
+    <!-- Inline script: apply persisted theme (or OS preference) BEFORE
+         React mounts to prevent flash of unstyled content (FOUC). -->
+    <script>
+      (function () {
+        try {
+          var stored = localStorage.getItem("hermes-theme");
+          var prefersDark = window.matchMedia("(prefers-color-scheme: dark)").matches;
+          if (stored === "dark" || (stored === null && prefersDark)) {
+            document.documentElement.classList.add("dark");
+          } else if (stored === "light") {
+            document.documentElement.classList.remove("dark");
+          }
+        } catch (e) {
+          // localStorage unavailable (private mode etc.) — fall through
+        }
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
