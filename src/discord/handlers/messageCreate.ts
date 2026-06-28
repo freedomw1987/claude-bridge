@@ -283,5 +283,30 @@ export async function handleMessageCreate(
     if (!ok) return;
   }
 
+  // P2.5: archive the user's message for the conversation feed. We
+  // archive the original `msg.content` (with mentions stripped by the
+  // parser upstream) and any attachments so the APP can re-render the
+  // full chat history. Hermes-mode messages are already journaled via
+  // the orchestrator, so skip them here.
+  if (session.mode !== "autopilot" && session.mode !== "manual") {
+    const { appendMessage } = await import("../../messages");
+    appendMessage(thread.id, {
+      ts: msg.createdTimestamp
+        ? new Date(msg.createdTimestamp).toISOString()
+        : new Date().toISOString(),
+      role: "user",
+      content: parsed.prompt,
+      meta: msg.attachments.size > 0
+        ? {
+            attachments: [...msg.attachments.values()].map((a) => ({
+              name: a.name,
+              size: a.size,
+              type: a.contentType ?? "unknown",
+            })),
+          }
+        : undefined,
+    });
+  }
+
   await forwardToClaude(msg, thread, parsed.prompt, session, store);
 }

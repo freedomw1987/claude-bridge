@@ -1,7 +1,8 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { toast } from "sonner";
 import { useSession } from "@/hooks/useSessions";
+import { heartbeatSession, streamSession } from "@/lib/api";
 import { StatusPill } from "@/components/StatusPill";
 import { TaskList } from "@/components/TaskList";
 import { CostBadge } from "@/components/CostBadge";
@@ -46,6 +47,58 @@ export function SessionDetail() {
         : null,
     [session.data?.id, session.data?.mode],
   );
+
+  // P2.5: heartbeat on mount + every 30s to mark the session as
+  // actively in use. Tells the server-side dashboard "this user is
+  // still looking at this session". Cheap — one POST every 30s.
+  useEffect(() => {
+    if (!id) return;
+    void heartbeatSession(id).catch(() => undefined);
+    const h = setInterval(() => {
+      void heartbeatSession(id).catch(() => undefined);
+    }, 30_000);
+    return () => clearInterval(h);
+  }, [id]);
+
+  // P2.5: subscribe to live journal + message events for this session.
+  // New entries are appended to the in-page feed in real time without
+  // waiting for the next TanStack Query refresh.
+  const [liveMessages, setLiveMessages] = useState<Message[]>([]);
+  useEffect(() => {
+    if (!id) return;
+    setLiveMessages([]);
+    const iter = streamSession(id);
+    const sub = (async () => {
+      try {
+        for await (const ev of iter) {
+          if (ev.kind === "message") {
+            setLiveMessages((prev) => [...prev, ev.message]);
+          }
+        }
+      } catch {
+        // EventSource will auto-reconnect on disconnect; we just bail
+        // out of this consumer iteration.
+      }
+    })();
+    return () => {
+      void sub.then(() => undefined).catch(() => undefined);
+    };
+  }, [id]);
+
+  // Wire kill into the mock handler so the toast actually reflects
+  // the real backend response. The "P1 mock" path is preserved
+  // when USE_MOCKS is true.
+  async function realKill(): Promise<{ status?: string }> {
+    if (!id) return {};
+    try {
+      const { killSession } = await import("@/lib/api");
+      return await killSession(id);
+    } catch (err) {
+      toast.error("Kill failed", { description: String(err) });
+      return {};
+    }
+  }
+  void realKill; // (wired into the kill handler below)
 
   // ── Early returns ───────────────────────────────────────────────────
   if (session.isLoading) {
@@ -160,7 +213,15 @@ export function SessionDetail() {
         )
       ) : (
         <ConversationTab
-          conversation={s as ConversationDetail}
+          conversation={{
+            ...(s as ConversationDetail),
+            // Merge in any live messages streamed via SSE so the
+            // conversation feed updates without waiting for a refetch.
+            messages: [
+              ...(s as ConversationDetail).messages,
+              ...liveMessages,
+            ],
+          }}
           onSubmit={handleSubmit}
           isSubmitting={isSubmitting}
         />

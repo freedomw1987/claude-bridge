@@ -226,6 +226,17 @@ export class SessionStore {
       .run(status, threadId);
   }
 
+  /**
+   * P2.5: bump lastActivityAt for a thread. Used by the HTTP server's
+   * /heartbeat endpoint to mark the session as actively in use. No-op
+   * if the row doesn't exist.
+   */
+  setLastActivityAt(threadId: string, lastActivityAtMs: number): void {
+    this.db
+      .prepare(`UPDATE sessions SET last_activity_at = ? WHERE thread_id = ?`)
+      .run(lastActivityAtMs, threadId);
+  }
+
   setClaudeSession(threadId: string, claudeSession: string): void {
     this.db
       .prepare(`UPDATE sessions SET claude_session = ? WHERE thread_id = ?`)

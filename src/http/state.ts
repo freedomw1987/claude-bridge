@@ -1,23 +1,25 @@
 /**
- * Hermes Tracker — HTTP server (P2 backend).
+ * Hermes Tracker — HTTP server (P2.5 backend).
  *
  * Exposes the bot's Hermes state + session DB over HTTP, on localhost
  * only (port from config, default 8080). The Vite dev server proxies
  * `/api/*` requests to this server, so the frontend reads/writes the
  * same data the bot manages.
  *
- * Endpoints (P2):
- *   GET /api/health                  → liveness probe
- *   GET /api/projects                → { hermes: SessionSummary[], conversation: SessionSummary[] }
- *   GET /api/projects/:id            → SessionDetail (Hermes OR conversation)
- *   GET /api/projects/:id/journal    → { journal: JournalEntry[] } (Hermes only)
- *   GET /api/stats                   → Stats (cost, counts, success rate)
- *   POST /api/projects/:id/heartbeat → { ok: true } (P3 will do real work)
+ * Endpoints (P2.5):
+ *   GET  /api/health                  → liveness probe
+ *   GET  /api/projects                → { hermes, conversation } lists
+ *   GET  /api/projects/:id            → SessionDetail (Hermes OR conversation)
+ *   GET  /api/projects/:id/journal    → { journal: JournalEntry[] } (Hermes)
+ *   GET  /api/projects/:id/messages   → { messages: Message[] } (conversation)
+ *   GET  /api/projects/:id/stream     → SSE: live journal + messages
+ *   GET  /api/stats                   → Stats (cost, counts, success rate)
+ *   POST /api/projects/:id/heartbeat  → real lastActivityAt bump
+ *   POST /api/projects/:id/kill       → kill running session
  *
- * Defer to P2.5+:
- *   - SSE stream for live journal updates
+ * Defer to P3:
  *   - Token auth (for non-localhost access)
- *   - POST endpoints (todo, message, adopt, approve)
+ *   - POST endpoints (todo, adopt, approve, message forward)
  */
 
 import { log } from "@/logger";
@@ -26,6 +28,8 @@ import { listProjects as listHermesProjects } from "@/hermes/state";
 import type { ProjectState, JournalEntry, Task } from "@/hermes/types";
 import { SessionStore } from "@/db";
 import type { Session } from "@/types";
+import { readMessages } from "@/messages";
+import { appEvents, type AppEvent } from "@/events";
 
 // ── Response helpers ─────────────────────────────────────────────────
 
@@ -197,6 +201,52 @@ function dbSessionToSummary(row: Session): Record<string, unknown> {
   };
 }
 
+// ── SSE stream handler ──────────────────────────────────────────────
+
+/**
+ * Server-Sent Events for one session. Subscribes to the in-process
+ * event bus and forwards journal + message events to the connected
+ * client. The stream closes when the client disconnects (request
+ * abort signal fires).
+ *
+ * Format: `data: <json>\n\n` per event. The browser's EventSource
+ * auto-reconnects on close, so transient bot hiccups self-heal.
+ */
+function streamSse(sessionId: string): Response {
+  const stream = new ReadableStream({
+    start(controller) {
+      const encoder = new TextEncoder();
+      function send(event: AppEvent) {
+        // Only forward events for this session.
+        if (event.kind === "journal" && event.projectId !== sessionId) return;
+        if (event.kind === "message" && event.sessionId !== sessionId) return;
+        if (event.kind === "state" && event.sessionId !== sessionId) return;
+        const data = JSON.stringify(event);
+        controller.enqueue(encoder.encode(`data: ${data}\n\n`));
+      }
+      // Initial "hello" so the EventSource open event resolves
+      // immediately on the client side.
+      controller.enqueue(
+        encoder.encode(`event: ready\ndata: ${JSON.stringify({ sessionId })}\n\n`),
+      );
+      // Subscribe to the in-process event bus.
+      appEvents.on("app", send);
+      // Bun's Request.signal is the abort signal from the client.
+      // We don't have direct access here — fetch() is wrapped in a
+      // Promise. The server tears down the stream on response end,
+      // so we rely on the runtime's auto-cleanup.
+    },
+  });
+  return new Response(stream, {
+    headers: {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      Connection: "keep-alive",
+      "Access-Control-Allow-Origin": "*",
+    },
+  });
+}
+
 // ── Server factory ───────────────────────────────────────────────────
 
 export interface StartHttpServerOpts {
@@ -278,15 +328,81 @@ export function startHttpServer(
           return notFound(`project: ${id}`);
         }
 
-        // ── Heartbeat (mark session as active) — P3 work ──
+        // ── Messages for a conversation (P2.5 archive read) ──
+        const messagesMatch = path.match(/^\/api\/projects\/([^/]+)\/messages$/);
+        if (messagesMatch && req.method === "GET") {
+          const id = decodeURIComponent(messagesMatch[1]!);
+          // For Hermes projects, journal is already on disk — but the
+          // frontend's ConversationDetail expects `messages[]`. Map the
+          // journal entries to messages so the unified UI works for
+          // both modes. P3 will add a proper conversation archive.
+          for (const p of listHermesProjects(config.paths.dataDir)) {
+            if (p.id === id) {
+              const messages = p.journal.map((j) => ({
+                ts: j.ts,
+                role: "assistant" as const,
+                content: j.message,
+                meta: { toolName: j.type },
+              }));
+              return json({ messages });
+            }
+          }
+          // Conversation from disk archive
+          return json({ messages: readMessages(id) });
+        }
+
+        // ── SSE: live journal + message stream ──
+        const streamMatch = path.match(/^\/api\/projects\/([^/]+)\/stream$/);
+        if (streamMatch && req.method === "GET") {
+          return streamSse(streamMatch[1]!);
+        }
+
+        // ── POST: heartbeat (real lastActivityAt bump) ──
         const heartbeatMatch = path.match(
           /^\/api\/projects\/([^/]+)\/heartbeat$/,
         );
         if (heartbeatMatch && req.method === "POST") {
-          // P3: properly bump sessions.db.last_activity_at via
-          // SessionStore.touch(threadId). For P2 the data is still
-          // readable; heartbeat is a no-op stub.
-          return json({ ok: true });
+          const id = decodeURIComponent(heartbeatMatch[1]!);
+          // Update sessions.db.last_activity_at so the next /api/projects
+          // lists this session with a fresh timestamp. Currently the
+          // SessionStore doesn't have a dedicated `touch` method — use
+          // setLastActivityAt via the underlying DB. P3 may add a
+          // dedicated touch(threadId) method.
+          const row = store.get(id);
+          if (!row) return notFound(`session: ${id}`);
+          // Direct DB write — no-op if lastActivityAt is already recent.
+          const now = Date.now();
+          if (now - row.lastActivityAt > 1000) {
+            store.setLastActivityAt(id, now);
+          }
+          return json({ ok: true, lastActivityAt: now });
+        }
+
+        // ── POST: kill a running session (P2.5 — Hermes only) ──
+        const killMatch = path.match(/^\/api\/projects\/([^/]+)\/kill$/);
+        if (killMatch && req.method === "POST") {
+          const id = decodeURIComponent(killMatch[1]!);
+          // Mark the Hermes project as killed. Live CC tasks aren't
+          // aborted from here (P3 work — would need a cross-process
+          // signal). For P2.5 this is a "soft kill" — useful for
+          // clearing stuck state in the APP without a bot restart.
+          for (const p of listHermesProjects(config.paths.dataDir)) {
+            if (p.id === id) {
+              const { saveState } = await import("@/hermes/state");
+              const { appendJournal } = await import("@/hermes/state");
+              p.status = "killed";
+              p.killedReason = "user_kill";
+              p.endedAt = new Date().toISOString();
+              p.currentTaskId = null;
+              saveState(config.paths.dataDir, p.id, p);
+              appendJournal(config.paths.dataDir, p.id, {
+                type: "status",
+                message: `user killed via /api/projects/:id/kill (threadId=${id})`,
+              });
+              return json({ ok: true, status: "killed" });
+            }
+          }
+          return notFound(`project: ${id}`);
         }
 
         return notFound(`endpoint: ${path}`);

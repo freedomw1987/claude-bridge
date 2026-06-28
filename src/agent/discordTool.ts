@@ -139,6 +139,15 @@ export function createDiscordSendTool(
       } else {
         msg = await deps.send(content);
       }
+      // P2.5: archive the CC message so the conversation feed in the
+      // APP can re-render the full chat history after bot restart.
+      const { appendMessage } = await import("../messages");
+      appendMessage(deps.thread.id, {
+        ts: new Date().toISOString(),
+        role: "assistant",
+        content,
+        meta: { toolName: "discord_send" },
+      });
       log.info("discord_send posted", { message_id: msg.id });
       return textResult(
         JSON.stringify({ message_id: msg.id, content_length: msg.content.length }),

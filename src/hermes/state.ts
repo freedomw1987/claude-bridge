@@ -187,6 +187,15 @@ export function appendJournal(
     join(dir, "journal.log"),
     `${full.ts} [${full.type}] ${full.message}\n`,
   );
+  // P2.5: emit on the in-process event bus so the HTTP server can
+  // push SSE updates to connected frontends. Imported lazily to avoid
+  // a circular dependency (state.ts is imported by the bot's index,
+  // which in turn starts the HTTP server which would also want events).
+  // The dynamic import is fine — events.ts has no side effects at
+  // module load time.
+  void import("../events").then(({ appEvents }) => {
+    appEvents.emit("app", { kind: "journal", projectId, entry: full });
+  });
 }
 
 /** Write the human-readable plan.md (called once after planning completes). */
