@@ -14,6 +14,7 @@ import { ProjectRegistry } from "./projects/registry";
 import { startMemoryMonitor } from "./memoryMonitor";
 import { resumeActiveProjects } from "./hermes/orchestrator";
 import { resolveHermesDir } from "./hermes/state";
+import { startHttpServer } from "./http/state";
 
 const IDLE_SWEEP_INTERVAL_MS = 60 * 1000; // check every minute
 
@@ -105,6 +106,13 @@ async function main(): Promise<void> {
       },
       (threadId) => store.get(threadId)?.claudeSession ?? null,
     );
+  }
+
+  // P2 backend (Hermes Tracker APP, 2026-06-27). HTTP server bound
+  // to 127.0.0.1 only. Disable via HTTP_ENABLED=0 (useful for the
+  // bot-only deploys where there's no Tauri/Vite consumer).
+  if (config.runtime.httpEnabled) {
+    startHttpServer({ store });
   }
 
   // Idle sweep: mark active sessions as 'idle' if last_activity_at is older

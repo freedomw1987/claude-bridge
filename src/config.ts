@@ -61,6 +61,11 @@ export const config = {
     // turn to finish, short enough that an impatient operator can
     // SIGKILL after ~30s without losing much work.
     shutdownGraceMs: optionalInt("SHUTDOWN_GRACE_MS", 30_000),
+    // P2 backend HTTP server (Hermes Tracker APP, 2026-06-27).
+    // Binds to 127.0.0.1 only (single-user trust boundary). The
+    // frontend's Vite dev server proxies /api/* to this port.
+    httpPort: optionalInt("HTTP_PORT", 8080),
+    httpEnabled: optional("HTTP_ENABLED", "1") === "1",
   },
   claude: {
     defaultPermissionMode: optional("CLAUDE_DEFAULT_PERMISSION_MODE", "acceptEdits"),
