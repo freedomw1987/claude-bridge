@@ -1,5 +1,5 @@
-import { useMemo, useState } from "react";
-import { Link } from "react-router-dom";
+import { useEffect, useMemo, useState } from "react";
+import { Link, useSearchParams } from "react-router-dom";
 import { toast } from "sonner";
 import { useSessions, useStats } from "@/hooks/useSessions";
 import { SessionCard } from "@/components/SessionCard";
@@ -34,7 +34,26 @@ const FILTERS: { key: FilterMode; label: string }[] = [
 ];
 
 export function Dashboard() {
-  const [filter, setFilter] = useState<FilterMode>("all");
+  const [searchParams, setSearchParams] = useSearchParams();
+  // The default filter can be overridden via `?mode=hermes` (from the
+  // Projects nav item). The filter state lives in the URL so the
+  // browser back/forward works correctly and the filter survives reload.
+  const filterFromUrl = (searchParams.get("mode") as FilterMode | null);
+  const initialFilter: FilterMode =
+    filterFromUrl === "hermes" || filterFromUrl === "conversation"
+      ? filterFromUrl
+      : "all";
+  const [filter, setFilter] = useState<FilterMode>(initialFilter);
+
+  // Keep URL in sync when user clicks a tab.
+  useEffect(() => {
+    const urlMode = searchParams.get("mode");
+    const wantMode = filter === "all" ? null : filter;
+    if (urlMode !== wantMode) {
+      setSearchParams(wantMode ? { mode: wantMode } : {}, { replace: true });
+    }
+  }, [filter, searchParams, setSearchParams]);
+
   const [isSubmitting, setIsSubmitting] = useState(false);
   const sessions = useSessions();
   const stats = useStats();
