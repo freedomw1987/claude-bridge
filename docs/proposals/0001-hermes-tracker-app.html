@@ -1,0 +1,608 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Hermes Tracker APP — Proposal (2026-06-27)</title>
+<style>
+  :root {
+    --bg: #0f1115;
+    --bg-soft: #1a1d23;
+    --bg-elev: #232830;
+    --border: #2d3340;
+    --fg: #e4e6eb;
+    --fg-dim: #9aa3b2;
+    --fg-muted: #6b7280;
+    --accent: #5b9dff;
+    --accent-2: #7dd3fc;
+    --success: #4ade80;
+    --warn: #fbbf24;
+    --danger: #f87171;
+    --code-bg: #15181d;
+    --shadow: 0 1px 0 rgba(255,255,255,0.04), 0 8px 24px rgba(0,0,0,0.3);
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI",
+                 Roboto, "Helvetica Neue", Arial, sans-serif;
+    font-size: 15px;
+    line-height: 1.65;
+    color: var(--fg);
+    background: var(--bg);
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap {
+    max-width: 1080px;
+    margin: 0 auto;
+    padding: 48px 32px 96px;
+    display: grid;
+    grid-template-columns: 220px 1fr;
+    gap: 48px;
+  }
+  nav.toc {
+    position: sticky;
+    top: 32px;
+    align-self: start;
+    max-height: calc(100vh - 64px);
+    overflow-y: auto;
+  }
+  nav.toc h4 {
+    margin: 0 0 12px;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 1.4px;
+    color: var(--fg-muted);
+  }
+  nav.toc ol {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+  }
+  nav.toc li { margin: 4px 0; }
+  nav.toc a {
+    display: block;
+    color: var(--fg-dim);
+    text-decoration: none;
+    padding: 4px 8px;
+    border-radius: 6px;
+    font-size: 13px;
+    transition: background 0.15s, color 0.15s;
+  }
+  nav.toc a:hover {
+    background: var(--bg-soft);
+    color: var(--fg);
+  }
+  main { min-width: 0; }
+  h1 {
+    margin: 0 0 8px;
+    font-size: 36px;
+    line-height: 1.15;
+    letter-spacing: -0.5px;
+    background: linear-gradient(120deg, #fff 30%, var(--accent) 100%);
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+  }
+  h1 + .meta {
+    color: var(--fg-muted);
+    font-size: 13px;
+    margin-bottom: 40px;
+  }
+  h2 {
+    margin: 56px 0 16px;
+    padding-bottom: 8px;
+    border-bottom: 1px solid var(--border);
+    font-size: 22px;
+    letter-spacing: -0.3px;
+  }
+  h3 {
+    margin: 28px 0 12px;
+    font-size: 17px;
+    color: var(--accent-2);
+  }
+  p { margin: 0 0 14px; }
+  a { color: var(--accent); }
+  ul, ol { padding-left: 22px; }
+  li { margin: 4px 0; }
+  code {
+    font-family: "SF Mono", Menlo, Monaco, Consolas, monospace;
+    font-size: 13px;
+    background: var(--code-bg);
+    padding: 1px 6px;
+    border-radius: 4px;
+    border: 1px solid var(--border);
+  }
+  pre {
+    background: var(--code-bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px 20px;
+    overflow-x: auto;
+    font-size: 13px;
+    line-height: 1.55;
+  }
+  pre code {
+    background: transparent;
+    padding: 0;
+    border: 0;
+  }
+  table {
+    border-collapse: collapse;
+    width: 100%;
+    margin: 16px 0;
+    font-size: 14px;
+  }
+  th, td {
+    text-align: left;
+    padding: 10px 12px;
+    border-bottom: 1px solid var(--border);
+    vertical-align: top;
+  }
+  th {
+    color: var(--fg-dim);
+    font-weight: 600;
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.6px;
+  }
+  tbody tr:hover { background: var(--bg-soft); }
+  td:first-child { font-weight: 500; }
+  blockquote {
+    margin: 16px 0;
+    padding: 12px 18px;
+    background: var(--bg-soft);
+    border-left: 3px solid var(--accent);
+    border-radius: 0 8px 8px 0;
+    color: var(--fg-dim);
+  }
+  .callout {
+    margin: 20px 0;
+    padding: 16px 20px;
+    border-radius: 10px;
+    border: 1px solid var(--border);
+    background: var(--bg-soft);
+    box-shadow: var(--shadow);
+  }
+  .callout.info { border-left: 3px solid var(--accent); }
+  .callout.warn { border-left: 3px solid var(--warn); }
+  .callout.ok { border-left: 3px solid var(--success); }
+  .callout p:last-child { margin-bottom: 0; }
+  .tag {
+    display: inline-block;
+    padding: 2px 8px;
+    background: var(--bg-elev);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    font-size: 11px;
+    color: var(--fg-dim);
+    font-family: "SF Mono", Menlo, monospace;
+    margin-right: 4px;
+  }
+  .tag.reco { background: rgba(74, 222, 128, 0.12); color: var(--success); border-color: rgba(74,222,128,0.3); }
+  .tag.req { background: rgba(91, 157, 255, 0.12); color: var(--accent); border-color: rgba(91,157,255,0.3); }
+  .card-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+    gap: 14px;
+    margin: 20px 0;
+  }
+  .card {
+    padding: 16px;
+    background: var(--bg-soft);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    box-shadow: var(--shadow);
+  }
+  .card h4 { margin: 0 0 6px; font-size: 14px; color: var(--accent-2); }
+  .card p { margin: 0; font-size: 13px; color: var(--fg-dim); }
+  .mockup {
+    margin: 16px 0;
+    background: var(--bg-soft);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 18px 22px;
+    font-family: "SF Mono", Menlo, monospace;
+    font-size: 12.5px;
+    line-height: 1.7;
+    color: var(--fg-dim);
+    white-space: pre-wrap;
+  }
+  .mockup .accent { color: var(--accent); }
+  .mockup .ok { color: var(--success); }
+  .mockup .warn { color: var(--warn); }
+  .mockup .danger { color: var(--danger); }
+  .mockup .dim { color: var(--fg-muted); }
+  .stat-row {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 12px;
+    margin: 16px 0 24px;
+  }
+  .stat {
+    padding: 14px 18px;
+    background: var(--bg-soft);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+  }
+  .stat .label {
+    font-size: 11px;
+    color: var(--fg-muted);
+    text-transform: uppercase;
+    letter-spacing: 1px;
+  }
+  .stat .value {
+    margin-top: 4px;
+    font-size: 22px;
+    font-weight: 600;
+    color: var(--accent-2);
+  }
+  .timeline {
+    margin: 16px 0;
+    padding-left: 0;
+    list-style: none;
+    border-left: 2px solid var(--border);
+  }
+  .timeline li {
+    position: relative;
+    padding: 6px 0 14px 22px;
+    margin: 0;
+  }
+  .timeline li::before {
+    content: "";
+    position: absolute;
+    left: -7px;
+    top: 12px;
+    width: 12px;
+    height: 12px;
+    border-radius: 50%;
+    background: var(--accent);
+    border: 3px solid var(--bg);
+  }
+  .timeline li:last-child::before { background: var(--success); }
+  .timeline .phase {
+    color: var(--fg-muted);
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.8px;
+  }
+  .timeline .title {
+    color: var(--fg);
+    font-size: 14px;
+    font-weight: 500;
+  }
+  .footer {
+    margin-top: 80px;
+    padding-top: 24px;
+    border-top: 1px solid var(--border);
+    color: var(--fg-muted);
+    font-size: 12px;
+    text-align: center;
+  }
+  @media (max-width: 880px) {
+    .wrap { grid-template-columns: 1fr; padding: 24px 18px 64px; }
+    nav.toc { position: static; max-height: none; margin-bottom: 24px; }
+    .stat-row { grid-template-columns: repeat(2, 1fr); }
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<nav class="toc">
+  <h4>Contents</h4>
+  <ol>
+    <li><a href="#pain">Pain point</a></li>
+    <li><a href="#capabilities">4 capabilities</a></li>
+    <li><a href="#read">A. Read — progress</a></li>
+    <li><a href="#write">B. Write — add Todo</a></li>
+    <li><a href="#approve">C. Plan approval</a></li>
+    <li><a href="#platform">D. Cross-platform</a></li>
+    <li><a href="#stack">Tech stack</a></li>
+    <li><a href="#phases">Phased rollout</a></li>
+    <li><a href="#data">Data model</a></li>
+    <li><a href="#api">API surface</a></li>
+    <li><a href="#decisions">Decisions</a></li>
+    <li><a href="#out">Out of scope</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<h1>Hermes Tracker APP</h1>
+<p class="meta">Proposal · 2026-06-27 · David (claude-bridge maintainer)</p>
+
+<blockquote>
+Discord thread = 訊息流,難掌握 overall project progress。
+本提案將 Hermes 由 <strong>fire-and-forget autonomous PM</strong> 變成 <strong>supervised planning</strong> —
+Claude 提出 plan,你睇完先批。
+</blockquote>
+
+<div class="stat-row">
+  <div class="stat"><div class="label">Phases</div><div class="value">6</div></div>
+  <div class="stat"><div class="label">MVP effort</div><div class="value">~7-8 d</div></div>
+  <div class="stat"><div class="label">Tech stack</div><div class="value">Bun · HTMX · Tailwind</div></div>
+  <div class="stat"><div class="label">Cross-platform</div><div class="value">Web · PWA · Tauri?</div></div>
+</div>
+
+<h2 id="pain">Pain point</h2>
+<p>Discord 適合 command-driven workflow,</p>
+<ul>
+  <li>❌ <strong>冇全局視角</strong> — 要逐個 thread 入去先睇到 plan / journal / cost</li>
+  <li>❌ <strong>冇 timeline visualization</strong> — Discord 係 linear chat,journal 唔容易睇</li>
+  <li>❌ <strong>冇 friendly doc review</strong> — <code>plan.md</code> 係 raw markdown,要打開 VS Code 讀</li>
+  <li>❌ <strong>冇 structured Todo summary</strong> — 冇地方睇「邊啲 task 做咗 / 邊啲 pending」</li>
+  <li>❌ <strong>冇 push notification</strong> — 重要事件(project done / fail / cost spike)冇主動通知</li>
+</ul>
+
+<h2 id="capabilities">4 capabilities</h2>
+<div class="card-grid">
+  <div class="card"><h4>A · Read</h4><p>Summarized project progress — structured Todo view + AI summary + live updates</p></div>
+  <div class="card"><h4>B · Write</h4><p>Add Todo interactively — quick append OR multi-turn Claude conversation</p></div>
+  <div class="card"><h4>C · Approve</h4><p>Plan/Doc approval workflow — review <code>plan.md</code> as HTML before execution starts</p></div>
+  <div class="card"><h4>D · Cross-platform</h4><p>Web UI (responsive) + PWA install on mobile + optional Tauri desktop</p></div>
+</div>
+
+<h2 id="read">A · Read — Summarized progress</h2>
+
+<h3>Per-project view</h3>
+<div class="mockup">┌─ abc12345 ─ build auth module ─────────────────────┐
+│ <span class="accent">Status:</span>  ⚙️ executing (auto, 1h 23m left) │
+│ <span class="accent">Cost:</span>   $1.62 / $5.00                          │
+│ <span class="accent">Progress:</span> 4/6 tasks (66%)                        │
+│                                                       │
+│ ▸ t1 Set up database        <span class="ok">✓ done</span>  $0.12        │
+│ ▸ t2 User auth API          <span class="ok">✓ done</span>  $0.45        │
+│ ▸ t3 Login UI               <span class="ok">✓ done</span>  $0.30        │
+│ ▸ t4 Password reset         <span class="ok">✓ done</span>  $0.55        │
+│ ▸ t5 Integration tests      <span class="danger">✗ fail</span>  $0.20        │
+│ ▸ t6 Documentation          <span class="dim">⏳ todo</span>                 │
+│                                                       │
+│ <span class="accent">AI Summary:</span>                                    │
+│ "Auth module 66% complete. Integration tests failed  │
+│  on first attempt (DB race); retry in progress.       │
+│  Documentation is the next planned task."             │
+└─────────────────────────────────────────────────────┘</div>
+
+<h3>Implementation</h3>
+<ul>
+  <li>Static view 從 <code>state.plan</code> + <code>state.costUsd</code> + <code>state.timer</code> 直接 render(冇 AI)</li>
+  <li>AI Summary 用 haiku summarizer — <code>journal.log</code> recent N entries → 2-3 sentences status</li>
+  <li>New <code>summarizeProject(state)</code> helper(unit-testable)</li>
+  <li>Live update via SSE — plan task status 即時 refresh</li>
+</ul>
+
+<h2 id="write">B · Write — Add Todo (Interactive)</h2>
+
+<h3>Mode A: Quick add</h3>
+<div class="mockup">[+ Add Todo]
+  Title: implement dark mode toggle
+  Description: should respect system preference
+
+  [Cancel]  [Submit →]</div>
+<p>Flow:</p>
+<ol>
+  <li>APP → <code>POST /api/projects/:id/todos {title, description}</code></li>
+  <li>Bot appends 到 <code>state.plan</code> 直接</li>
+  <li>Save state, push SSE event "new task added"</li>
+  <li>Orchestrator 下一個 judge pass 自然 incorporate</li>
+</ol>
+
+<h3>Mode B: Interactive w/ Claude</h3>
+<div class="mockup">[+ Add Todo (with Claude)]
+  Goal: implement dark mode
+
+  <span class="accent">💬 Claude:</span> "What framework are you using?"
+  <span class="ok">📝 You:</span>  React + Tailwind
+  <span class="accent">💬 Claude:</span> "Should it persist user choice across sessions?"
+  <span class="ok">📝 You:</span>  yes
+  <span class="accent">💬 Claude:</span> "Got it. Proposed task:"
+            ─────────────────────
+            t7: Add dark mode toggle
+            ─ React + Tailwind, persists in localStorage
+            ─ Auto-detect system preference
+            ─ Add manual override in settings
+            ─────────────────────
+  [Cancel]  [Refine]  [<span class="ok">✓ Approve & Add</span>]</div>
+<p>Flow:</p>
+<ol>
+  <li>APP → <code>POST /api/projects/:id/todos/interactive {goal}</code> 開新 conversation</li>
+  <li>Bot spawn Claude sub-agent(haiku, permissionMode="plan")用 MCP tools ↔ APP</li>
+  <li>APP ↔ Claude 來回直到 Claude 提出 proposed task spec</li>
+  <li>Approve → 寫入 plan</li>
+  <li>加 budget timer 防止無限 loop</li>
+</ol>
+
+<h2 id="approve">C · Plan/Doc approval workflow</h2>
+
+<h3>Phase 0 — Hermes 寫 doc</h3>
+<pre><code>User: /project start "build a CLI todo app"
+  ↓
+Planner LLM generates:
+  - state.plan (array of tasks)
+  - plan.md (human-readable, currently ignored by APP)
+  ↓
+Hermes saves both, transitions status → "awaiting_approval"</code></pre>
+
+<h3>Phase 1 — APP 推送通知</h3>
+<div class="mockup">┌─ Notifications ────────────────────┐
+│ <span class="warn">📋</span> abc12345 needs plan review          │
+│   "build a CLI todo app"             │
+│   7 tasks proposed, est. $1.20       │
+│   [<span class="ok">Review plan →</span>]                       │
+└─────────────────────────────────────┘</div>
+<p>SSE push: <code>event: approval-needed</code></p>
+
+<h3>Phase 2 — Plan review UI(HTML rendered)</h3>
+<div class="mockup">┌─ Plan: build a CLI todo app ──────────────────────┐
+│ <span class="accent">Summary:</span> A 7-task plan to scaffold a Node.js │
+│ CLI with persistent storage and JSON output.   │
+│                                                  │
+│ <span class="accent">📋 Plan</span>                                     │
+│ ─────────────────────────                       │
+│ ## Tasks                                        │
+│ ▢ t1: Initialize Node.js project + deps         │
+│ ▢ t2: Define Todo interface (TS)                │
+│ ▢ t3: Implement file-based persistence         │
+│ ▢ t4: Add commands: add / list / done / rm     │
+│ ▢ t5: Add JSON output flag                      │
+│ ▢ t6: Write unit tests                          │
+│ ▢ t7: Write README + smoke test                │
+│                                                  │
+│ <span class="warn">⚠️ Risks</span>                                     │
+│ - File locking not addressed (single-user only) │
+│ - No migration story if schema changes         │
+│                                                  │
+│ <span class="accent">💰</span> Estimated cost: $1.20  (6-8 min)           │
+│ <span class="accent">⏱</span>  Estimated wall: 30m                         │
+│                                                  │
+│ <span class="accent">💬 Comments (0)</span> ────                            │
+│ [Add a comment...]                               │
+│                                                  │
+│ [<span class="danger">Reject</span>]  [Request changes]  [<span class="accent">✏️ Edit tasks</span>]  [<span class="ok">✓ Approve & run</span>]
+└──────────────────────────────────────────────────┘</div>
+
+<p><strong>Markdown → HTML</strong>: server-side 用 <code>marked</code> + <code>highlight.js</code>,cached by file mtime。</p>
+
+<h3>Phase 3 — User actions</h3>
+<table>
+  <thead><tr><th>Action</th><th>Result</th></tr></thead>
+  <tbody>
+    <tr><td><span class="tag ok">✓ Approve</span></td><td>Hermes <code>awaiting_approval</code> → <code>executing</code>,orchestrator 開工</td></tr>
+    <tr><td><span class="accent">✏️ Edit tasks</span></td><td>drag-drop reorder / delete / add → save → approve</td></tr>
+    <tr><td>Request changes</td><td>Free-form comment → planner refines → v2 plan</td></tr>
+    <tr><td><span class="danger">✗ Reject</span></td><td>Status <code>failed</code>, killedReason="user_rejected_plan"</td></tr>
+  </tbody>
+</table>
+
+<h2 id="platform">D · Cross-platform</h2>
+<ul>
+  <li><strong>Web UI</strong> — Responsive HTML, mobile-first</li>
+  <li><strong>PWA install</strong> — Mobile 用戶「加到主畫面」= standalone APP,離線 cache static assets</li>
+  <li><strong>Desktop</strong> — Browser tab (MVP),或者 Tauri wrapper (optional,~10MB binary)</li>
+</ul>
+
+<div class="callout info">
+<strong>唔推薦</strong>: React Native / Flutter / Native — over-engineering 對 single-user tool。
+Web + PWA 已經 cover 80% use case。
+</div>
+
+<h2 id="stack">Tech stack</h2>
+<table>
+  <thead><tr><th>Layer</th><th>Pick</th><th>Why</th></tr></thead>
+  <tbody>
+    <tr><td>Backend</td><td>Bun HTTP server(in bot)</td><td>Already running, +100 LoC</td></tr>
+    <tr><td>Realtime</td><td>Server-Sent Events</td><td>Single-direction, simple</td></tr>
+    <tr><td>Frontend</td><td>HTMX + Alpine + Tailwind</td><td>SSR, no SPA framework</td></tr>
+    <tr><td>Markdown</td><td><code>marked</code> server-side</td><td>50KB, Bun-friendly, cache</td></tr>
+    <tr><td>Syntax HL</td><td><code>highlight.js</code></td><td>Standard</td></tr>
+    <tr><td>Diagrams</td><td>Skip MVP</td><td>Optional, can add later</td></tr>
+    <tr><td>Auth</td><td>Shared secret + 127.0.0.1</td><td>Single user, LAN/Tailscale</td></tr>
+  </tbody>
+</table>
+
+<h2 id="phases">Phased rollout</h2>
+<ol class="timeline">
+  <li>
+    <div class="phase">P1 · Backend API</div>
+    <div class="title">Projects list/detail, journal SSE, stats endpoints</div>
+    <div style="color:var(--fg-muted);font-size:13px;margin-top:4px;"><span class="tag">~1 day</span></div>
+  </li>
+  <li>
+    <div class="phase">P2 · Read UI</div>
+    <div class="title">Dashboard, project detail, progress, AI summary</div>
+    <div style="color:var(--fg-muted);font-size:13px;margin-top:4px;"><span class="tag">~2-3 days</span></div>
+  </li>
+  <li>
+    <div class="phase">P2.5 · Doc Approval</div>
+    <div class="title">md → HTML, awaiting_approval state machine, comments</div>
+    <div style="color:var(--fg-muted);font-size:13px;margin-top:4px;"><span class="tag">~1-2 days</span></div>
+  </li>
+  <li>
+    <div class="phase">P3 · Add Todo</div>
+    <div class="title">Quick add + interactive w/ Claude (multi-turn chat)</div>
+    <div style="color:var(--fg-muted);font-size:13px;margin-top:4px;"><span class="tag">~2 days</span></div>
+  </li>
+  <li>
+    <div class="phase">P4 · PWA</div>
+    <div class="title">manifest.json + service worker, mobile install</div>
+    <div style="color:var(--fg-muted);font-size:13px;margin-top:4px;"><span class="tag">~0.5 day</span></div>
+  </li>
+  <li>
+    <div class="phase">P5 · Tauri (optional)</div>
+    <div class="title">Desktop wrapper,~10MB binary,system tray</div>
+    <div style="color:var(--fg-muted);font-size:13px;margin-top:4px;"><span class="tag">~2-3 days</span></div>
+  </li>
+</ol>
+
+<div class="callout ok">
+<strong>MVP (P1-P3)</strong>: ~7-8 working days。<br>
+<strong>Full (P1-P5)</strong>: ~10-12 days including Tauri wrapper。
+</div>
+
+<h2 id="data">Data model changes</h2>
+<p><code>state.json</code> 新加兩個 fields:</p>
+<pre><code>interface ProjectState {
+  // ... existing fields ...
+  status: ... | "awaiting_approval";  // NEW
+  approval?: ApprovalRequest;          // NEW
+}
+
+interface ApprovalRequest {
+  docPath: string;          // e.g. "plan.md"
+  docMtime: number;
+  requestedAt: string;
+  reviewerNotes?: string;
+  approvedAt?: string;
+  rejectedAt?: string;
+  rejectionReason?: string;
+}</code></pre>
+
+<h2 id="api">API surface</h2>
+<pre><code>GET   /api/projects
+GET   /api/projects/:id
+GET   /api/projects/:id/journal      # SSE stream
+GET   /api/projects/:id/plan.md
+GET   /api/projects/:id/plan.html    # rendered + cached
+GET   /api/projects/:id/approval
+POST  /api/projects/:id/approval     { action, notes? }
+POST  /api/projects/:id/comments
+POST  /api/projects/:id/todos        { title, description, mode? }
+POST  /api/projects/:id/kill
+POST  /api/projects/:id/resume</code></pre>
+
+<h2 id="decisions">Open decisions</h2>
+<table>
+  <thead><tr><th>#</th><th>Question</th><th>Recommendation</th></tr></thead>
+  <tbody>
+    <tr><td>D1</td><td>Quick add default?</td><td><span class="tag reco">B</span> Toggle — Quick by default</td></tr>
+    <tr><td>D2</td><td>Interactive model?</td><td><span class="tag reco">A</span> haiku(fast, cheap)</td></tr>
+    <tr><td>D3</td><td>AI summary update?</td><td><span class="tag reco">C</span> Cached + 5min TTL</td></tr>
+    <tr><td>D4</td><td>New Todo immediate pickup?</td><td><span class="tag reco">A</span> Yes — status → executing</td></tr>
+    <tr><td>D5</td><td>Phase order?</td><td><span class="tag reco">A</span> Read first, Write later</td></tr>
+    <tr><td>D6</td><td>Markdown lib?</td><td><span class="tag reco">A</span> <code>marked</code> server-side</td></tr>
+    <tr><td>D7</td><td>Comments scope?</td><td><span class="tag reco">A</span> plan-only MVP</td></tr>
+    <tr><td>D8</td><td>"Request changes" loop?</td><td><span class="tag reco">C</span> Hybrid — auto 1-2x then escalate</td></tr>
+    <tr><td>D9</td><td>Plan mutability post-approval?</td><td><span class="tag reco">B</span> Immutable plan, judge can append</td></tr>
+    <tr><td>D10</td><td>Mermaid?</td><td><span class="tag reco">A</span> Skip MVP</td></tr>
+  </tbody>
+</table>
+
+<h2 id="out">Out of scope</h2>
+<ul>
+  <li>Multi-user / team / RBAC</li>
+  <li>HTTPS / TLS termination(用 Tailscale / ngrok)</li>
+  <li>Slack / Teams adapter</li>
+  <li>Voice / video</li>
+  <li>Real-time collaborative editing</li>
+</ul>
+
+<div class="footer">
+Hermes Tracker APP · proposal · saved at <code>docs/proposals/0001-hermes-tracker-app.html</code>
+</div>
+
+</main>
+</div>
+</body>
+</html>

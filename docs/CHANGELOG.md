@@ -5,6 +5,75 @@
 
 ---
 
+## [v2.1.0] — 2026-06-27
+
+**Phase 3 收尾 — 退役 CLI runner、refactor、hardening。**
+
+呢個 minor release 將 codebase 由「v2.0 Hermes 加 SDK 過渡版」做一次完整 hardening:
+- 退役 legacy CLI subprocess runner,單一 SDK path
+- 大文件拆細,DX 大幅改善
+- 修咗 3 個隱藏 bug(N3 真係 concurrency bug + appendJournal dead code + recursion → loop)
+- 加咗 graceful shutdown + Discord warning
+- RAM profile tooling 完整化
+
+### 🎯 主要功能
+
+- **Phase 3 — CLI runner 退役** — 刪 `runner.ts` / `events.ts` / `runner.test.ts`、`runner_kind` column、`/use-cli` `/use-sdk` commands、`CLAUDE_USE_SDK` env。Codebase -25%。
+- **Codebase 重組** — `hermesCommands.ts` (1483 行) 拆 8 modules;`orchestrator.ts` (858 行) 拆 6 modules;`format.ts` dead code 清咗。
+- **RAM profile tooling** — `scripts/ram-trace-analyze.ts` TypeScript analyzer + ASCII chart + Hermes-aware cross-correlation + `docs/operations/0004-ram-profiling.md` 使用指南。
+- **Graceful shutdown (G1+G2+G3)** — `SHUTDOWN_GRACE_MS` env (default 30000),SIGTERM 期間 in-flight runs 仲可以 finish;Post Discord warning 畀每個有 in-flight work 嘅 thread。
+
+### 🛡️ Reliability + Bug fixes
+
+- **N3 真 concurrency bug** — 之前 `activeProcessCount()` 唔 count SDK runs → SDK path 繞過 `MAX_CONCURRENT_CONTAINERS` cap,可能 over-spawn。已 fix。
+- **B1 appendJournal dead code** — 之前每次 append 都做多一次 sync `loadState` + JSON.parse,但 mutation 從來無 `saveState`,永遠被 overwrite。Hermes auto-mode 每 project ~20 浪費 disk reads。已清。
+- **B2 recursion → loop** — `runProject` 之前用 recursive call 處理 judge verdict `needs_more`,5-10 task project = 5-10 層 call stack。已改成 `while(true) + continue outer` label。Stack bounded 1 frame。
+- **Q1 registry statSync** — 之前每次 scan 都做 statSync(60 dirs = 60 syscalls)。`withFileTypes` 已經俾 `isDirectory()`,改為只 follow symlinks。
+- **env 白名單** — runner.ts 用 `buildSafeEnv()` 而唔係 `...process.env`,防止 AWS/GitHub/NPM tokens leak 落 Claude subprocess。
+- **SIGTERM grace + SIGKILL fallback** — cleanup.ts SIGTERM 2s grace + SIGKILL survivors,防止 orphaned processes。
+
+### 🔧 Maintainability + DX
+
+- **M1 void noise** — state.ts 3 處 `void _h;` 刪咗(TS 已經 accept `_` 開頭 destructured unused)。
+- **M3 classifyError** — orchestrator catch block 由 ~50 行 nested ternary 變 ~10 行 typed helper。
+- **T1 extractRawSnippet** — 同上,從 chained ternary 變兩行 instanceof check。
+- **M4 dedupe stripMention** — 新 `src/discord/stripMention.ts`,hermes/matchers.ts + messageCreate.ts 共用(7 unit tests)。
+- **B2 loopGuard 常數** — 改 `LOOP_GUARD_LIMIT` named constant。
+
+### 🏗️ Infrastructure
+
+- **SendQueue** 1100ms → 1000ms (+10% streaming throughput,仍然喺 Discord 5msg/5s limit 內)。
+- **Restart bot** — `SHUTDOWN_GRACE_MS` env var(30s default),可 override。
+
+### 📊 Scale
+
+| Metric | v2.0.0 | v2.1.0 |
+|--------|--------|--------|
+| Source LoC | ~16,500 | **~8,700** (-47%) |
+| Test count | 194 | **429** (+121%) |
+| Test expects | ~570 | 1,055 (+85%) |
+| Audit items closed | 11/44 | **25/44** (+14) |
+| Hermes RG fixes | 11 | 11(stable) |
+| Files > 500 LoC | 2 | **0** |
+| Untracked files | 0 | 0 |
+
+### 📚 文檔
+
+- `docs/proposals/0001-hermes-tracker-app.html` — Desktop + Mobile tracker APP 規劃 proposal(Bun + React + Tauri stack)。
+- `docs/operations/0004-ram-profiling.md` — RAM profile workflow + expected curve。
+- `docs/ANALYSIS-2026-06-27.md` — 完整項目分析 + 優化建議。
+
+### 🚀 Migration
+
+純內部重構 + bug fixes,zero 對外 API 改動。`runner_kind` column 由 SQLite migration 自動 drop(下次 bot start 即清)。`/use-cli` `/use-sdk` commands 已退役,如要 fallback,請用 `CLAUDE_USE_SDK=0` env(仍然支援,但 default 已係 SDK)。
+
+### 📌 Next
+
+- **v2.2.0** — Hermes Tracker APP Phase 1(Backend HTTP API + SSE)
+- 詳見 `docs/proposals/0001-hermes-tracker-app.html` 嘅 phased rollout plan
+
+---
+
 ## [v2.0.0] — 2026-06-22
 
 **Hermes 自動化開化 — 由「人手逐 task」進化到「David 講 goal, Hermes 自動拆 plan + 派 Claude Code + 自己 judge」**
