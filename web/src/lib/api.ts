@@ -219,5 +219,56 @@ export async function killSession(sessionId: string): Promise<{ ok: boolean; sta
   return res.json();
 }
 
+/** Add a task to a Hermes project's plan. P3: real persistence. */
+export async function addProjectTodo(
+  projectId: string,
+  todo: { title: string; description?: string },
+): Promise<{ ok: boolean; task?: { id: string; title: string } }> {
+  if (USE_MOCKS) return { ok: true, task: { id: "user-1", title: todo.title } };
+  const res = await fetch(
+    `/api/projects/${encodeURIComponent(projectId)}/todos`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(todo),
+    },
+  );
+  if (!res.ok) throw new Error(`addProjectTodo: ${res.status}`);
+  return res.json();
+}
+
+/** Adopt a conversation as a Hermes project. Returns the new projectId. */
+export async function adoptConversation(
+  threadId: string,
+  payload: { goal: string; mode?: "auto" | "manual" },
+): Promise<{ ok: boolean; projectId?: string }> {
+  if (USE_MOCKS) {
+    return { ok: true, projectId: "mock-adopted-" + Date.now() };
+  }
+  const res = await fetch(
+    `/api/sessions/${encodeURIComponent(threadId)}/adopt`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    },
+  );
+  if (!res.ok) throw new Error(`adoptConversation: ${res.status}`);
+  return res.json();
+}
+
+/** Approve a Hermes project (no-op in current bot, kept for APP UX). */
+export async function approveProject(
+  projectId: string,
+): Promise<{ ok: boolean; status?: string }> {
+  if (USE_MOCKS) return { ok: true, status: "approved" };
+  const res = await fetch(
+    `/api/projects/${encodeURIComponent(projectId)}/approve`,
+    { method: "POST" },
+  );
+  if (!res.ok) throw new Error(`approveProject: ${res.status}`);
+  return res.json();
+}
+
 // Re-export the detail types so callers can import them from one place.
 export type { SessionSummary, SessionDetail, ConversationDetail, HermesProjectDetail };

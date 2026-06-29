@@ -405,6 +405,108 @@ export function startHttpServer(
           return notFound(`project: ${id}`);
         }
 
+        // ── POST: add a todo to a Hermes project's plan ──
+        const todoMatch = path.match(/^\/api\/projects\/([^/]+)\/todos$/);
+        if (todoMatch && req.method === "POST") {
+          const projectId = decodeURIComponent(todoMatch[1]!);
+          const body = (await req.json()) as { title?: unknown; description?: unknown };
+          const title = typeof body.title === "string" ? body.title.trim() : "";
+          const description =
+            typeof body.description === "string" ? body.description.trim() : "";
+          if (!title) {
+            return json({ error: "invalid_input", message: "title required" }, { status: 400 });
+          }
+          for (const p of listHermesProjects(config.paths.dataDir)) {
+            if (p.id === projectId) {
+              const { saveState, appendJournal } = await import("@/hermes/state");
+              const nextNum =
+                p.plan.filter((t) => t.id.startsWith("user-")).length + 1;
+              const id = `user-${nextNum}`;
+              const task = {
+                id,
+                title,
+                description,
+                status: "pending" as const,
+                attempts: 0,
+                dependsOn: [],
+              };
+              p.plan.push(task);
+              saveState(config.paths.dataDir, p.id, p);
+              appendJournal(config.paths.dataDir, p.id, {
+                type: "task_start",
+                message: `${id}: ${title} (user-added)`,
+              });
+              return json({ ok: true, task });
+            }
+          }
+          return notFound(`project: ${projectId}`);
+        }
+
+        // ── POST: approve a Hermes project (no-op in current bot) ──
+        const approveMatch = path.match(/^\/api\/projects\/([^/]+)\/approve$/);
+        if (approveMatch && req.method === "POST") {
+          const projectId = decodeURIComponent(approveMatch[1]!);
+          // In the current bot, Hermes projects auto-start after
+          // planning. The "awaiting_approval" status was removed.
+          // The endpoint returns 200 OK for any existing project so
+          // the APP's "Approve & run" button always works (no-op).
+          for (const p of listHermesProjects(config.paths.dataDir)) {
+            if (p.id === projectId) return json({ ok: true, status: p.status });
+          }
+          return notFound(`project: ${projectId}`);
+        }
+
+        // ── POST: adopt a conversation as a Hermes project ──
+        // Body: { goal, mode }
+        // Returns: { ok, projectId } — frontend navigates to the
+        // new project's detail page.
+        const adoptMatch = path.match(/^\/api\/sessions\/([^/]+)\/adopt$/);
+        if (adoptMatch && req.method === "POST") {
+          const threadId = decodeURIComponent(adoptMatch[1]!);
+          const dbRow = store.get(threadId);
+          if (!dbRow) return notFound(`conversation: ${threadId}`);
+          const body = (await req.json()) as { goal?: unknown; mode?: unknown };
+          const goal = typeof body.goal === "string" ? body.goal.trim() : "";
+          const mode = body.mode === "manual" ? "manual" : "auto";
+          if (!goal) {
+            return json({ error: "invalid_input", message: "goal required" }, { status: 400 });
+          }
+
+          const { randomUUID } = await import("node:crypto");
+          const { adoptProject } = await import("@/hermes/orchestrator");
+          const newProjectId = randomUUID();
+          const runtime = {
+            maxIterations: config.hermes.maxIterations,
+            maxCostUsd: config.hermes.maxCostUsd,
+            maxWallHours: config.hermes.maxWallHours,
+            hermesModel: config.hermes.model,
+            maxAttemptsPerTask: config.hermes.maxAttemptsPerTask,
+          };
+          const project = adoptProject({
+            hermesDir: config.paths.dataDir,
+            projectId: newProjectId,
+            threadId,
+            goal,
+            mode,
+            repoPath: dbRow.repoPath,
+            repoRoot: dbRow.repoPath,
+            repoSource: "local",
+            config: runtime,
+            adoption: {
+              fromSession: true,
+              adoptedAt: new Date().toISOString(),
+              originalRepoPath: dbRow.repoPath,
+              originalSessionId: dbRow.claudeSession ?? "<no-session-id>",
+            },
+          });
+          log.info("http: conversation adopted as Hermes project", {
+            projectId: newProjectId,
+            threadId,
+            goal,
+          });
+          return json({ ok: true, projectId: project.id });
+        }
+
         return notFound(`endpoint: ${path}`);
       } catch (err) {
         return serverError(err);

@@ -2,7 +2,8 @@ import { useEffect, useMemo, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { toast } from "sonner";
 import { useSession } from "@/hooks/useSessions";
-import { heartbeatSession, streamSession } from "@/lib/api";
+import { adoptConversation, heartbeatSession, streamSession } from "@/lib/api";
+import { useNavigate } from "react-router-dom";
 import { StatusPill } from "@/components/StatusPill";
 import { TaskList } from "@/components/TaskList";
 import { CostBadge } from "@/components/CostBadge";
@@ -36,6 +37,7 @@ type HermesTab = "conversation" | "overview";
 export function SessionDetail() {
   const { id } = useParams<{ id: string }>();
   const session = useSession(id);
+  const navigate = useNavigate();
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [hermesTab, setHermesTab] = useState<HermesTab>("conversation");
 
@@ -159,14 +161,28 @@ export function SessionDetail() {
   }
 
   /**
-   * P1 mock: "Adopt as Hermes project" — Phase 3 wires this to
-   * POST /api/sessions/:id/adopt. After adoption the session.mode
-   * becomes "hermes" and the page re-renders as the Hermes view.
+   * P3: real adoption — POST /api/sessions/:id/adopt creates a new
+   * Hermes project from this conversation. On success, navigate to
+   * the new project so the user sees the Hermes tabs view.
    */
-  function handleAdopt() {
-    toast.success("Adopted as Hermes project (mock)", {
-      description: `Phase 3 wires POST /api/sessions/${s.id}/adopt. The page would reload in Hermes mode.`,
-    });
+  async function handleAdopt() {
+    if (!s) return;
+    try {
+      const goal = s.goal.startsWith("Thread session in ")
+        ? s.goal.replace(/^Thread session in /, "Work in ")
+        : s.goal;
+      const result = await adoptConversation(s.id, { goal, mode: "auto" });
+      if (result.ok && result.projectId) {
+        toast.success("Adopted as Hermes project", {
+          description: `New project: ${result.projectId.slice(0, 8)}`,
+        });
+        navigate(`/sessions/${result.projectId}`);
+      } else {
+        toast.error("Adopt failed", { description: "no projectId returned" });
+      }
+    } catch (err) {
+      toast.error("Adopt failed", { description: String(err) });
+    }
   }
 
   return (

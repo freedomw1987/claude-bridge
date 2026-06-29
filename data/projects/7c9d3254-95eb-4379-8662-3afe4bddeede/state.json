@@ -1,0 +1,47 @@
+{
+  "id": "7c9d3254-95eb-4379-8662-3afe4bddeede",
+  "threadId": "1520353012198015088",
+  "createdAt": "2026-06-29T00:06:21.353Z",
+  "updatedAt": "2026-06-29T00:06:21.484Z",
+  "goal": "refactor auth module",
+  "mode": "auto",
+  "repoPath": "/Users/davidchu/www/claude-bridge",
+  "repoSource": "local",
+  "repoRoot": "/Users/davidchu/www/claude-bridge",
+  "status": "planning",
+  "plan": [
+    {
+      "id": "user-1",
+      "title": "add tests",
+      "description": "vitest for new module",
+      "status": "pending",
+      "attempts": 0,
+      "dependsOn": []
+    }
+  ],
+  "currentTaskId": null,
+  "iterations": 0,
+  "costUsd": 0,
+  "config": {
+    "maxIterations": 20,
+    "maxCostUsd": 500,
+    "maxWallHours": 4,
+    "hermesModel": "MiniMax-M3",
+    "maxAttemptsPerTask": 3
+  },
+  "startedAt": "2026-06-29T00:06:21.353Z",
+  "endedAt": null,
+  "journal": [
+    {
+      "ts": "2026-06-29T00:06:21.353Z",
+      "type": "status",
+      "message": "Project created. Mode=auto, repoPath=/Users/davidchu/www/claude-bridge"
+    }
+  ],
+  "adoption": {
+    "fromSession": true,
+    "adoptedAt": "2026-06-29T00:06:21.352Z",
+    "originalRepoPath": "/Users/davidchu/www/claude-bridge",
+    "originalSessionId": "92b0063a-45fa-4a6b-b2a1-00680e5c3b80"
+  }
+}
