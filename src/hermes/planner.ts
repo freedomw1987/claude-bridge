@@ -18,6 +18,7 @@ import { config } from "../config";
 import { log } from "../logger";
 import { z } from "zod";
 import { stripThinkTags } from "../discord/handlers/format";
+import { extractJson, JsonExtractError } from "./jsonExtract";
 import type { Task } from "./types";
 
 /**
@@ -251,14 +252,31 @@ Decompose the goal into 3-10 concrete tasks. Return JSON only.`;
   const cleaned = stripCodeFences(collected);
   let parsed;
   try {
-    parsed = PLAN_RESPONSE_SCHEMA.parse(JSON.parse(cleaned));
+    // P2.5 stability: use the robust extractor. It tries the whole
+    // string first, then walks balanced `{...}` objects in source
+    // order. This handles the common LLM failure mode where the
+    // model emits prose ("Now I have enough context. Let me write
+    // the plan file.") before the actual JSON.
+    parsed = extractJson(cleaned, collected, PLAN_RESPONSE_SCHEMA);
   } catch (err) {
     // RG-010: throw a typed PlannerParseError so the orchestrator
     // can transition the project to status="parse_error" with a
     // clear escalation message. We preserve the first 500 chars of
     // the raw LLM output so the failure is debuggable from the
     // project journal later.
-    log.error("hermes planner: parse failed", {
+    if (err instanceof JsonExtractError) {
+      log.error("hermes planner: extract failed", {
+        raw: collected.slice(0, 1000),
+        cleaned: cleaned.slice(0, 1000),
+      });
+      throw new PlannerParseError({
+        raw: collected.slice(0, 500),
+        cleaned: cleaned.slice(0, 500),
+        cause: err,
+      });
+    }
+    // Zod validation failure (extracted JSON didn't match schema).
+    log.error("hermes planner: schema validation failed", {
       raw: collected.slice(0, 1000),
       cleaned: cleaned.slice(0, 1000),
       err: String(err),

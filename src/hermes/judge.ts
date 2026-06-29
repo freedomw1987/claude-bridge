@@ -61,6 +61,7 @@ import { query, type SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 import { config } from "../config";
 import { log } from "../logger";
 import { z } from "zod";
+import { extractJson } from "./jsonExtract";
 import { stripThinkTags } from "../discord/handlers/format";
 import type { JudgeVerdict, ProjectState, Task } from "./types";
 
@@ -379,7 +380,10 @@ Is the goal met? Return JSON only.`;
   const cleaned = stripCodeFences(collected);
   let parsed;
   try {
-    parsed = JUDGE_RESPONSE_SCHEMA.parse(JSON.parse(cleaned));
+    // P2.5 stability: use the robust extractor (handles LLM prose
+    // before/after the JSON, balanced-brace parsing). See
+    // jsonExtract.ts for the full strategy.
+    parsed = extractJson(cleaned, collected, JUDGE_RESPONSE_SCHEMA);
   } catch (err) {
     // RG-011: throw a typed JudgeParseError so the orchestrator can
     // transition the project to status="judge_parse_error" with a

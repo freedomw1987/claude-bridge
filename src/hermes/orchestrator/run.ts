@@ -254,12 +254,32 @@ export async function runProject(
  * for bugs that aren't recognized typed errors.
  */
 interface ErrorClassification {
-  status: "timed_out" | "parse_error" | "judge_timed_out" | "judge_parse_error" | "failed";
+  status: "timed_out" | "parse_error" | "judge_timed_out" | "judge_parse_error" | "killed" | "failed";
   journalMessage: (projectShortId: string, rawSnippet: string | null) => string;
   escalationMessage: string;
 }
 
 function classifyError(err: unknown): ErrorClassification {
+  // P2.5 stability: detect "aborted by user" or "process aborted"
+  // errors and classify them as `killed` instead of `failed`. The
+  // CC subprocess's underlying error message when it receives
+  // SIGTERM is the literal string "aborted by user" or "Claude Code
+  // process aborted by user" — both indicate WE initiated the abort
+  // (via /kill, shutdown, or turn timeout), not a real CC error.
+  const errStr = String(err).toLowerCase();
+  if (
+    errStr.includes("aborted by user") ||
+    errStr.includes("process aborted") ||
+    errStr.includes("aborted by signal") ||
+    errStr.includes("connection closed mid-response")
+  ) {
+    return {
+      status: "killed",
+      journalMessage: (id) =>
+        `run aborted; project ${id} ended in killed. err=${errStr.slice(0, 200)}`,
+      escalationMessage: `🛑 Claude Code run was aborted (likely /kill, turn timeout, or process shutdown). Try /project resume to restart.`,
+    };
+  }
   if (err instanceof PlannerTimeoutError) {
     return {
       status: "timed_out",
