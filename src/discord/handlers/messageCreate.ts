@@ -308,5 +308,30 @@ export async function handleMessageCreate(
     });
   }
 
-  await forwardToClaude(msg, thread, parsed.prompt, session, store);
+  // P2.5 stability: preflight for Anthropic's per-message token cap.
+  // The SDK's session is persistent (claudeSession field in DB), so
+  // context accumulates across turns. A single very long message
+  // can blow past the per-message limit and surface as
+  // "API Error: 400 invalid params, context window exceeds limit
+  // (2013)" — seen in bot.err.log on 2026-06-27. We approximate
+  // tokens as chars/4 (a common rule-of-thumb; the SDK would
+  // tokenize for real but we want a fast guard). 90k chars ≈ 22.5k
+  // tokens, comfortably under all current model per-message limits.
+  const MAX_PROMPT_CHARS = 90_000;
+  let promptForCC = parsed.prompt;
+  if (parsed.prompt.length > MAX_PROMPT_CHARS) {
+    const truncated = parsed.prompt.slice(0, MAX_PROMPT_CHARS);
+    promptForCC =
+      truncated +
+      "\n\n[… message truncated at " +
+      MAX_PROMPT_CHARS +
+      " characters; the rest of your input was dropped to stay under the model's per-message cap. …]";
+    log.warn("messageCreate: truncated oversized message", {
+      threadId: thread.id,
+      originalLen: parsed.prompt.length,
+      truncatedLen: promptForCC.length,
+    });
+  }
+
+  await forwardToClaude(msg, thread, promptForCC, session, store);
 }
