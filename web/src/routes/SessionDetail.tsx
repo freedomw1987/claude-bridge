@@ -425,9 +425,13 @@ function MessageFeed({ messages }: { messages: Message[] }) {
         </span>
       </div>
       {messages.length === 0 ? (
-        <p className="rounded-lg border border-dashed border-border bg-bg-soft p-6 text-center text-sm text-fg-muted">
-          No messages yet.
-        </p>
+        <div className="rounded-lg border border-dashed border-border bg-bg-soft p-6 text-center text-sm">
+          <p className="text-fg">No messages yet in this conversation.</p>
+          <p className="mt-1 text-xs text-fg-muted">
+            Send a message below to start the archive. New messages
+            and replies will appear here in real time (live SSE).
+          </p>
+        </div>
       ) : (
         <ol className="space-y-2">
           {messages.map((m, i) => (
@@ -605,9 +609,14 @@ function JournalFeed({
         </span>
       </div>
       {ordered.length === 0 ? (
-        <p className="rounded-lg border border-dashed border-border bg-bg-soft p-6 text-center text-sm text-fg-muted">
-          No journal entries yet.
-        </p>
+        <div className="rounded-lg border border-dashed border-border bg-bg-soft p-6 text-center text-sm">
+          <p className="text-fg">No journal entries yet.</p>
+          <p className="mt-1 text-xs text-fg-muted">
+            Hermes auto-journal begins when the project starts
+            executing its first task. Use <code className="font-mono">/project start</code>
+            in Discord or wait for the orchestrator to begin.
+          </p>
+        </div>
       ) : (
         <ol className="space-y-0.5 rounded-lg border border-border bg-bg-soft p-2 font-mono text-xs">
           {ordered.map((j, i) => (
