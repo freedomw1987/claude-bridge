@@ -15,7 +15,7 @@
  * readable at a glance.
  */
 
-import type { Message, ThreadChannel } from "discord.js";
+import type { Client, Message, ThreadChannel } from "discord.js";
 import { config } from "../../config";
 import { log } from "../../logger";
 import { existsSync, mkdirSync } from "node:fs";
@@ -41,6 +41,14 @@ import { stripMention } from "../stripMention";
 interface HandlerDeps {
   store: SessionStore;
   projects: ProjectRegistry;
+  /**
+   * Discord client, used to prime the channel cache before any
+   * `msg.channel.isThread()` access. P2.5 stability: without this,
+   * a `ChannelNotCached` error throws on the first access for
+   * messages whose channels have been evicted from the cache
+   * (long-running bot, cache pruned, etc.).
+   */
+  client: Client;
 }
 
 const isMentioningBot = (msg: Message, botUserId: string): boolean => {
@@ -57,7 +65,7 @@ export async function handleMessageCreate(
   msg: Message,
   deps: HandlerDeps,
 ): Promise<void> {
-  const { store, projects } = deps;
+  const { store, projects, client } = deps;
 
   if (msg.author.bot) {
     log.debug("ignored: bot author", { authorId: msg.author.id });
@@ -66,6 +74,28 @@ export async function handleMessageCreate(
   if (msg.author.id !== config.discord.allowedUserId) {
     log.debug("ignored: unauthorized user", { authorId: msg.author.id });
     return;
+  }
+
+  // P2.5 stability: prime the channel cache so `msg.channel` access
+  // below doesn't throw `ChannelNotCached`. This was an intermittent
+  // failure in data/bot.err.log on 2026-06-23 — usually when a
+  // messageCreate fires shortly after the bot process restarted
+  // (cache empty) or after Discord pruned old channels. fetch()
+  // returns the cache hit instantly if present; only the cold path
+  // hits the API. We don't bail out on failure (Unknown Channel
+  // etc.) — msg.channelId is still usable, the rest of the handler
+  // just skips channel-shape checks.
+  if (!msg.channel) {
+    try {
+      await client.channels.fetch(msg.channelId);
+    } catch (err) {
+      log.warn("messageCreate: failed to prime channel cache", {
+        channelId: msg.channelId,
+        err: String(err),
+      });
+      // Continue without the cache prime — the bot can still operate
+      // on channelId alone (e.g. look up sessions.db by id).
+    }
   }
 
   // Channel gate: either a top-level message in the configured channel,

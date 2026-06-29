@@ -48,7 +48,7 @@ export function createClient(deps: {
   });
 
   client.on(Events.MessageCreate, (msg) => {
-    handleMessageCreate(msg, { store, projects }).catch((err) => {
+    handleMessageCreate(msg, { store, projects, client }).catch((err) => {
       log.error("messageCreate handler failed", {
         err: String(err),
         messageId: msg.id,

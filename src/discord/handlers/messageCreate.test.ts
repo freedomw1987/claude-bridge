@@ -140,7 +140,7 @@ describe("handleMessageCreate — auth gate", () => {
     const { store, projects, cleanup } = setupDeps();
     try {
       const { msg, reply } = mockMsg({ isBot: true });
-      await handleMessageCreate(msg as never, { store, projects });
+      await handleMessageCreate(msg as never, { store, projects, client: null as never });
       expect(reply.called).toBe(false);
       expect(store.list()).toHaveLength(0);
     } finally {
@@ -152,7 +152,7 @@ describe("handleMessageCreate — auth gate", () => {
     const { store, projects, cleanup } = setupDeps();
     try {
       const { msg, reply } = mockMsg({ authorId: "different-user" });
-      await handleMessageCreate(msg as never, { store, projects });
+      await handleMessageCreate(msg as never, { store, projects, client: null as never });
       expect(reply.called).toBe(false);
     } finally {
       cleanup();
@@ -168,7 +168,7 @@ describe("handleMessageCreate — mention flow", () => {
         content: `<@${BOT_ID}>`,
         mentionsBot: true,
       });
-      await handleMessageCreate(msg as never, { store, projects });
+      await handleMessageCreate(msg as never, { store, projects, client: null as never });
       expect(reply.called).toBe(true);
       expect(reply.args[0]).toBe(EMPTY_PROMPT_TEXT);
       // No thread should be created for an empty prompt
@@ -186,7 +186,7 @@ describe("handleMessageCreate — mention flow", () => {
         content: `<@${BOT_ID}> hello`,
         mentionsBot: true,
       });
-      await handleMessageCreate(msg as never, { store, projects });
+      await handleMessageCreate(msg as never, { store, projects, client: null as never });
       expect(reply.called).toBe(false);
     } finally {
       cleanup();
@@ -203,7 +203,7 @@ describe("handleMessageCreate — thread reply flow", () => {
         threadId: "unknown-thread",
         content: "hello",
       });
-      await handleMessageCreate(msg as never, { store, projects });
+      await handleMessageCreate(msg as never, { store, projects, client: null as never });
       expect(reply.called).toBe(true);
       expect(reply.args[0]).toBe(NO_SESSION_TEXT);
     } finally {
@@ -219,7 +219,7 @@ describe("handleMessageCreate — thread reply flow", () => {
         threadId: "unknown-thread",
         content: "/help",
       });
-      await handleMessageCreate(msg as never, { store, projects });
+      await handleMessageCreate(msg as never, { store, projects, client: null as never });
       expect(reply.called).toBe(true);
       expect(reply.args[0]).toBe(HELP_TEXT);
     } finally {
@@ -243,7 +243,7 @@ describe("handleMessageCreate — thread reply flow", () => {
         threadId: "thread-1",
         content: "/kill",
       });
-      await handleMessageCreate(msg as never, { store, projects });
+      await handleMessageCreate(msg as never, { store, projects, client: null as never });
       expect(reply.called).toBe(true);
       expect(reply.args[0]).toContain("Session killed");
       const session = store.get("thread-1")!;
@@ -261,7 +261,7 @@ describe("handleMessageCreate — thread reply flow", () => {
         threadId: "unknown-thread",
         content: "/kill",
       });
-      await handleMessageCreate(msg as never, { store, projects });
+      await handleMessageCreate(msg as never, { store, projects, client: null as never });
       expect(reply.called).toBe(true);
       // Should NOT have tried to setStatus on a non-existent session
       expect(reply.args[0]).toBe(NO_SESSION_TEXT);
