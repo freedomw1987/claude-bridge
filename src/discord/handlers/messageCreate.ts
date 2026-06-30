@@ -194,9 +194,13 @@ export async function handleMessageCreate(
     promptLen: parsed.prompt.length,
   });
 
-  // Empty prompt: just @bot with no content. Don't create a useless thread.
+  // Empty prompt: just @bot with no content. Allow if the user
+  // attached a file (the file is the message — even @bot with an
+  // attachment should forward to CC). Otherwise, no point creating
+  // a useless thread.
   if (
     parsed.prompt.trim() === "" &&
+    msg.attachments.size === 0 &&
     !parsed.newProject &&
     !parsed.repoUrl &&
     !parsed.localPath
@@ -361,6 +365,19 @@ export async function handleMessageCreate(
       originalLen: parsed.prompt.length,
       truncatedLen: promptForCC.length,
     });
+  }
+
+  // P2.5: download any user attachments to local disk and append
+  // their paths to the prompt so CC can inspect them via the Read
+  // tool. We stream the download (no full-file buffer) and skip
+  // failures individually so a single bad attachment doesn't block
+  // the message.
+  if (msg.attachments.size > 0) {
+    const { downloadAttachments, attachmentPromptSuffix } = await import(
+      "../../attachments"
+    );
+    const downloaded = await downloadAttachments(msg.id, msg.attachments, session);
+    promptForCC += attachmentPromptSuffix(downloaded);
   }
 
   await forwardToClaude(msg, thread, promptForCC, session, store);

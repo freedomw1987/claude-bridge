@@ -80,6 +80,9 @@ const mockMsg = (overrides: MockMsgOverrides = {}) => {
     client: { user: { id: BOT_ID } },
     channelId: overrides.channelId ?? CHANNEL_ID,
     channel,
+    // Empty Collection-like object — handler only reads .size, so a
+    // plain {} with size 0 is enough.
+    attachments: { size: 0 },
     mentions: {
       users: {
         get size() {
