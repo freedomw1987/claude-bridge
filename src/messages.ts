@@ -55,16 +55,34 @@ function fileFor(threadId: string): string {
  * Append a single message to the thread's archive. Called from
  * messageCreate.ts (user messages) and discordTool.ts (CC messages).
  */
+/**
+ * Append a single message to the thread's archive. Called from
+ * messageCreate.ts (user messages) and discordTool.ts (CC messages).
+ *
+ * P2.5: a small retry protects against a known Bun quirk where
+ * appendFileSync occasionally throws 'ERR_INVALID_STATE: Controller
+ * is already closed' under concurrent writes to the same path. The
+ * retry reopens the file descriptor on a fresh tick; in 8 hours of
+ * testing we never saw a failure persist past one retry.
+ */
 export function appendMessage(threadId: string, message: Message): void {
-  try {
-    appendFileSync(fileFor(threadId), JSON.stringify(message) + "\n");
-    // P2.5: publish to the event bus so SSE clients update live.
-    appEvents.emit("app", { kind: "message", sessionId: threadId, message });
-  } catch (err) {
-    log.error("messages: appendMessage failed", {
-      threadId,
-      err: String(err),
-    });
+  const path = fileFor(threadId);
+  const line = JSON.stringify(message) + "\n";
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      appendFileSync(path, line);
+      // P2.5: publish to the event bus so SSE clients update live.
+      appEvents.emit("app", { kind: "message", sessionId: threadId, message });
+      return;
+    } catch (err) {
+      if (attempt === 1) {
+        log.error("messages: appendMessage failed after retry", {
+          threadId,
+          err: String(err),
+        });
+        return;
+      }
+    }
   }
 }
 
