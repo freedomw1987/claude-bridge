@@ -39,3 +39,4 @@ out/
 
 # Hermes agent runtime state (not source code)
 docs/_meta/
+data/messages/1519876786576556122.jsonl
