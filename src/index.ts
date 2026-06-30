@@ -15,6 +15,7 @@ import { startMemoryMonitor } from "./memoryMonitor";
 import { resumeActiveProjects } from "./hermes/orchestrator";
 import { resolveHermesDir } from "./hermes/state";
 import { startHttpServer } from "./http/state";
+import { notifyDeath } from "./utils/notifyDeath";
 
 const IDLE_SWEEP_INTERVAL_MS = 60 * 1000; // check every minute
 
@@ -35,6 +36,14 @@ process.on("unhandledRejection", (reason) => {
 process.on("uncaughtException", (err) => {
   log.error("uncaughtException", {
     err: String(err),
+    stack: err.stack,
+  });
+  // G4 (2026-06-30): notify Discord BEFORE the 250ms exit timer so David
+  // gets a ping on the way out. notifyDeath is fire-and-forget (unref'd
+  // spawn) so the parent process.exit(1) 250ms later does not kill it.
+  notifyDeath({
+    reason: "uncaughtException",
+    detail: String(err),
     stack: err.stack,
   });
   // Give the logger a tick to flush, then exit so KeepAlive respawns.
@@ -175,6 +184,13 @@ async function main(): Promise<void> {
         downForMs: downFor,
         graceMs: GW_DISCONNECT_GRACE_MS,
       });
+      // G4 (2026-06-30): notify Discord before exiting so David gets
+      // pinged even when offline. This was the silent-death path that
+      // hid the 2026-06-30 06:29 zombie incident for hours.
+      notifyDeath({
+        reason: "gatewayDeadBeyondGrace",
+        detail: `status=${status} downForMs=${downFor} graceMs=${GW_DISCONNECT_GRACE_MS}`,
+      });
       setTimeout(() => process.exit(1), 250);
     }
   }, GW_HEALTH_INTERVAL_MS);
@@ -225,5 +241,11 @@ async function main(): Promise<void> {
 
 main().catch((err) => {
   log.error("fatal", { err: String(err), stack: (err as Error).stack });
+  // G4 (2026-06-30): notify Discord before exit (last-resort path).
+  notifyDeath({
+    reason: "mainCatch",
+    detail: String(err),
+    stack: (err as Error).stack,
+  });
   process.exit(1);
 });
